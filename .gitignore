@@ -1,0 +1,14 @@
+# Build output
+build/
+
+# Vendored tools: 60 MB of binaries that belong to their own projects.
+# tools/build-sp800-90b.sh rebuilds ea_non_iid; arduino-cli comes from the
+# Arduino IDE AppImage (see the README).
+tools/arduino-cli
+tools/arduino-lint
+tools/ea_non_iid
+tools/rngread
+third_party/
+
+# Assessment runs: megabytes of raw samples, reproducible with tools/assess.sh
+captures/

@@ -1,0 +1,4 @@
+# clockdrift_rng built with RNG_VENDOR=1: let a plain user read the random
+# bytes over libusb. The kernel's cdc_acm driver keeps the serial port either
+# way -- the requests are addressed to the device, not to an interface.
+SUBSYSTEM=="usb", ATTR{idVendor}=="16d0", ATTR{idProduct}=="087e", MODE="0666"
