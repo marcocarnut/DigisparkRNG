@@ -118,3 +118,25 @@ samples after each of many power-ups, checked for column-wise predictability.
 It is the one test that catches a source which looks fine within a run but
 starts from the same place every boot, and within-run testing cannot see that
 at all.
+
+## License and credits
+
+GPL version 2, in `LICENSE`. The firmware links V-USB through
+[DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast), and V-USB is
+distributed by [Objective Development](https://www.obdev.at/vusb/) under the
+GPL version 2 or version 3 (with a commercial license offered separately), so
+the combined work is covered by the GPL.
+
+`clockdrift_rng/ascon_permute.S` is not mine: it is the AVR assembler
+permutation from [ascon/ascon-c](https://github.com/ascon/ascon-c)
+(`crypto_hash/asconxof128/avr_lowsize`, commit 446347f) by L. Cardoso and
+J. Großschädl of the University of Luxembourg, under CC0-1.0, with only the
+function name changed. Its header says so and should stay.
+
+Ascon is the NIST lightweight cryptography standard (SP 800-232). The entropy
+assessment uses NIST's SP 800-90B `ea_non_iid`, built by
+`tools/build-sp800-90b.sh`. `tools/rngread.c` links libusb (LGPL-2.1+).
+
+There is no circuit diagram because there is no circuit: the entropy comes
+from the watchdog oscillator's drift against the CPU clock and from the ADC's
+own amplifier noise, with nothing attached to the board.
