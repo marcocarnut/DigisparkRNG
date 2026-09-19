@@ -69,10 +69,10 @@ Sizes on the Digispark, of the 6650 bytes micronucleus leaves and 512 of RAM:
 
 | build | flash | RAM |
 |---|---|---|
-| default | 6062 | 382 |
-| `STREAM_MODE=0` | 5932 | 381 |
-| `RNG_VENDOR=1` | 5924 | 387 |
-| both | 5762 | 386 |
+| default | 6014 | 372 |
+| `STREAM_MODE=0` | 5884 | 371 |
+| `RNG_VENDOR=1` | 5880 | 377 |
+| both | 5718 | 376 |
 
 ## Modes
 
@@ -176,17 +176,26 @@ Both transports measure the same 285 bytes/s, so the choice costs nothing.
 estimator over them. What the sketch credits is deliberately below what the
 estimator returns:
 
-| source | estimated | credited |
-|---|---|---|
-| watchdog intervals | 6.44 bits/sample | 1 |
-| ADC readings | 1.09 bits/sample | 1 |
+| source | estimated | samples | credited |
+|---|---|---|---|
+| watchdog intervals | 6.71 bits/sample | 180,291 | 1 |
+| ADC readings | 1.10 bits/sample | 1,244,295 | 1 |
+
+The estimate moves from run to run: the interval source has measured 6.44,
+6.55, 6.71, 6.76 and 6.82 across an hour-long run each, on this firmware and
+on [rngtacho](https://github.com/marcocarnut/rngtacho)'s two-port variant of
+it. That spread is why the health test cutoffs below are computed from the
+*lowest* of them rather than the latest, and why the credit is 1.
 
 The intervals are cut hardest because part of their jitter is USB polling
 latency, which the host controls rather than physics.
 
 SP 800-90B's continuous health tests (repetition count, adaptive proportion)
 run on every sample with cutoffs for alpha = 2^-40; a source that fails stops
-being credited, and `rngread --info` says so.
+being credited, and `rngread --info` says so. A higher assessed entropy gives
+*tighter* cutoffs, so taking them from the lowest estimate seen keeps false
+alarms at or under alpha in every condition measured; taking them from the
+latest run would be chasing the spread.
 
 **Not yet done:** the restart test (SP 800-90B section 3.1.4) -- the first
 samples after each of many power-ups, checked for column-wise predictability.
