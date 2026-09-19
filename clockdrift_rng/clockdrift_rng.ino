@@ -177,7 +177,7 @@ static char mode = DEFAULT_MODE;
 // indexing those needs a multiply, which the compiler does with a library
 // call, and a call inside an interrupt makes it save every call-clobbered
 // register. (From the rngtacho session, which measured 58 bytes on its build.)
-static uint32_t ringOvf[RING_SIZE];  // Timer1 overflow count
+static uint16_t ringOvf[RING_SIZE];  // Timer1 overflow count, low 16 bits
 static uint8_t  ringT1[RING_SIZE];   // TCNT1 (ticks every 64 CPU cycles)
 static uint8_t  ringT0[RING_SIZE];   // TCNT0 (ticks every CPU cycle)
 static volatile uint8_t ringHead, ringTail;
@@ -189,7 +189,11 @@ ISR(WDT_vect)
   // constant (it folds into the calibration offset below).
   uint8_t t0 = TCNT0;
   uint8_t t1 = TCNT1;
-  uint32_t ovf = millis_timer_overflow_count;
+  // Only the low half of the count is ever used (see the timestamp arithmetic
+  // below). Reading it alone is still consistent: the millis interrupt cannot
+  // run inside this one. A uint16_t* cast would trip -Wstrict-aliasing.
+  const volatile uint8_t *count = (const volatile uint8_t *)&millis_timer_overflow_count;
+  uint16_t ovf = count[0] | count[1] << 8;
   if ((TIFR & _BV(TOV1)) && t1 < 255)  // pending overflow not yet counted
     ovf++;
 
@@ -424,7 +428,7 @@ static int8_t readAdc()
   return v > 127 ? 127 : v < -128 ? -128 : v;
 }
 
-static void processInterval(uint32_t interval)
+static void processInterval(uint16_t interval)  // the low 16 bits
 {
   if (conditioned()) {
     absorb(interval >> 8);
@@ -598,7 +602,7 @@ void setup()
 void loop()
 {
   // stamp[0]: last timestamp already used; stamp[1]: awaiting validation
-  static uint32_t stamp[2];
+  static __uint24 stamp[2];
   static bool haveFineOffset;
   static uint8_t fineOffset;
 
@@ -668,12 +672,12 @@ void loop()
 
   while (ringTail != ringHead) {
     uint8_t t = ringTail;  // the slot is not written by the ISR until popped
-    uint32_t cOvf = ringOvf[t];
+    __uint24 cOvf = ringOvf[t];
     uint8_t cT1 = ringT1[t], cT0 = ringT0[t];
     ringTail = (t + 1) & (RING_SIZE - 1);
 
     // Timer1 position in CPU cycles; its low byte is always a multiple of 64.
-    uint32_t coarse = ((cOvf << 8) | cT1) << 6;
+    __uint24 coarse = ((cOvf << 8) | cT1) << 6;
     // TCNT0 minus that is (Timer1 prescaler phase + constant) mod 256, where
     // the phase is 0..63. Centre the first sample at 128 so later ones land
     // in 65..191 and never wrap; the resulting constant offset cancels out
@@ -683,15 +687,15 @@ void loop()
       fineOffset = phase - 128;
       haveFineOffset = true;
     }
-    uint32_t timestamp = coarse + (uint8_t)(phase - fineOffset);
+    __uint24 timestamp = coarse + (uint8_t)(phase - fineOffset);
 
     if (stamps < 2) {
       stamp[stamps++] = timestamp;
       continue;  // stamp[0] is never checked, so its interval is not used
     }
-    int32_t curvature = (timestamp - stamp[1]) - (stamp[1] - stamp[0]);
-    if (curvature > TIMER1_OVF_CYCLES)
-      stamp[1] += TIMER1_OVF_CYCLES;
+    __int24 curvature = (__int24)((timestamp - stamp[1]) - (stamp[1] - stamp[0]));
+    if (curvature > (__int24)TIMER1_OVF_CYCLES)
+      stamp[1] += (__uint24)TIMER1_OVF_CYCLES;
     if (stamps == 3)
       processInterval(stamp[1] - stamp[0]);  // unsigned, wraps correctly
     else
