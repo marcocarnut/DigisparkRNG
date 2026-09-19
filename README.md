@@ -101,6 +101,21 @@ will fail PractRand, and should: a source carrying about one bit of entropy
 per byte is not meant to look uniform, only to be unpredictable. Those are
 different properties and only the second one matters here.
 
+### Read the binary modes with the tty in raw mode
+
+A tty starts cooked, with echo on, and a serial port's echo goes back *to the
+device*. In `X`, `S`, `r` and `d` that means the host echoes random bytes back
+at the sketch, and about one byte in 256 is a mode character -- so the mode
+changes by itself, and a stream turns into a trickle of something else. The
+default `x` is immune, hex digits being no command, which is why this went
+unnoticed for so long.
+
+    stty -F /dev/ttyACM0 raw -echo
+
+`tools/rngread.c` is unaffected (it never opens the tty) and so is anything
+that sets raw mode itself. A `cat` or a plain `open()` is not. (Found by the
+rngtacho session, on a device that had quietly switched itself to `r`.)
+
 ## Two transports
 
 `RNG_VENDOR` chooses how the bytes leave the chip:

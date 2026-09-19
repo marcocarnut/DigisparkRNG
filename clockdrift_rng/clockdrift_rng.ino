@@ -165,12 +165,6 @@ static uint8_t overruns;              // captures dropped waiting to be read
 extern "C" volatile unsigned long millis_timer_overflow_count;  // wiring.c
 extern "C" void ascon_permute(uint8_t *state, uint8_t rounds);  // ascon_permute.S
 
-struct Capture {
-  uint32_t ovf;   // Timer1 overflow count
-  uint8_t  t1;    // TCNT1 (ticks every 64 CPU cycles)
-  uint8_t  t0;    // TCNT0 (ticks every CPU cycle)
-};
-
 struct Health {       // SP 800-90B health test state for one source
   uint8_t last, repeats;       // repetition count test
   uint8_t aptSample;           // adaptive proportion test
@@ -179,7 +173,13 @@ struct Health {       // SP 800-90B health test state for one source
 };
 
 static char mode = DEFAULT_MODE;
-static Capture ring[RING_SIZE];
+// The captures, one array per field rather than an array of 6-byte structs:
+// indexing those needs a multiply, which the compiler does with a library
+// call, and a call inside an interrupt makes it save every call-clobbered
+// register. (From the rngtacho session, which measured 58 bytes on its build.)
+static uint32_t ringOvf[RING_SIZE];  // Timer1 overflow count
+static uint8_t  ringT1[RING_SIZE];   // TCNT1 (ticks every 64 CPU cycles)
+static uint8_t  ringT0[RING_SIZE];   // TCNT0 (ticks every CPU cycle)
 static volatile uint8_t ringHead, ringTail;
 static volatile bool overrun;
 
@@ -197,9 +197,10 @@ ISR(WDT_vect)
   if (next == ringTail) {
     overrun = true;
   } else {
-    ring[ringHead].ovf = ovf;
-    ring[ringHead].t1 = t1;
-    ring[ringHead].t0 = t0;
+    uint8_t h = ringHead;
+    ringOvf[h] = ovf;
+    ringT1[h] = t1;
+    ringT0[h] = t0;
     ringHead = next;
   }
 }
@@ -283,7 +284,7 @@ static void reportStack()
 #endif
 
 static uint8_t burst[BURST_BYTES];
-static uint16_t burstBits;
+static uint8_t burstLen;       // bytes in burst[]
 
 static bool conditioned()
 {
@@ -294,14 +295,14 @@ static bool conditioned()
   return mode == 'x' || mode == 'X';
 }
 
-static uint16_t burstCapacity()  // in bits
+static uint8_t burstCapacity()  // in bytes: whole intervals in 'r'
 {
-  return mode == 'r' ? BURST_BYTES / 2 * 16 : BURST_BYTES * 8;
+  return mode == 'r' ? BURST_BYTES / 2 * 2 : BURST_BYTES;
 }
 
 static void resetOutput()
 {
-  burstBits = 0;
+  burstLen = 0;
 }
 
 // ---------------------------------------------------------------- conditioning
@@ -364,7 +365,7 @@ static void addCredit(uint8_t amount)
 // in 'S' mode once seeded, whether or not it has.
 static void maybeSqueeze()
 {
-  if (!asconOk || burstBits == burstCapacity())
+  if (!asconOk || burstLen == burstCapacity())
     return;
   bool credited = credit >= CREDIT_PER_OUTPUT;
 #if STREAM_MODE
@@ -376,8 +377,8 @@ static void maybeSqueeze()
 #endif
   state[39] ^= 0x80;  // domain separation from absorbing
   ascon_permute(state, 12);
-  for (uint8_t i = 0; i < 8 && burstBits < burstCapacity(); i++, burstBits += 8)
-    burst[burstBits >> 3] = state[i];
+  for (uint8_t i = 0; i < 8 && burstLen < burstCapacity(); i++)
+    burst[burstLen++] = state[i];
   if (credited) {
     // Forget: 128 bits of the state zeroed, so earlier output cannot be
     // recovered from a later state. Only where fresh entropy paid for it --
@@ -402,9 +403,13 @@ static void initAscon()
   // Ascon-XOF128 IV; P12 of it must give the published initial state.
   static const uint8_t iv[8] PROGMEM = {0x03, 0x00, 0xcc, 0x00, 0x00, 0x08, 0x00, 0x00};
   static const uint8_t expected[8] PROGMEM = {0xeb, 0x47, 0x94, 0x8d, 0x76, 0xce, 0x82, 0xda};
-  memcpy_P(state, iv, 8);
+  for (uint8_t i = 0; i < 8; i++)  // loops rather than memcpy_P and memcmp_P,
+    state[i] = pgm_read_byte(&iv[i]);  // which nothing else here pulls in
   ascon_permute(state, 12);
-  asconOk = memcmp_P(state, expected, 8) == 0;
+  asconOk = true;
+  for (uint8_t i = 0; i < 8; i++)
+    if (state[i] != pgm_read_byte(&expected[i]))
+      asconOk = false;
 }
 
 // ------------------------------------------------------------------- sampling
@@ -429,10 +434,9 @@ static void processInterval(uint32_t interval)
                 INTERVAL_APT_CUTOFF, PSTR("interval health test failed")))
       addCredit(INTERVAL_CREDIT);
   } else if (mode == 'r') {
-    if (burstBits < burstCapacity()) {
-      burst[burstBits >> 3] = interval >> 8;
-      burst[(burstBits >> 3) + 1] = interval;
-      burstBits += 16;
+    if (burstLen < burstCapacity()) {
+      burst[burstLen++] = interval >> 8;
+      burst[burstLen++] = interval;
     }
   }
 }
@@ -451,7 +455,7 @@ static void restartCapture()
 
 static void sendBurst()
 {
-  uint8_t bytes = burstBits / 8;
+  uint8_t bytes = burstLen;
 #if RNG_VENDOR
   // Nothing is sent: the host takes the burst with RNG_RQ_READ. Capture stays
   // stopped until it does, so no sample is taken while the burst waits, and
@@ -663,16 +667,18 @@ void loop()
   }
 
   while (ringTail != ringHead) {
-    Capture c = ring[ringTail];  // slot is not written by the ISR until popped
-    ringTail = (ringTail + 1) & (RING_SIZE - 1);
+    uint8_t t = ringTail;  // the slot is not written by the ISR until popped
+    uint32_t cOvf = ringOvf[t];
+    uint8_t cT1 = ringT1[t], cT0 = ringT0[t];
+    ringTail = (t + 1) & (RING_SIZE - 1);
 
     // Timer1 position in CPU cycles; its low byte is always a multiple of 64.
-    uint32_t coarse = ((c.ovf << 8) | c.t1) << 6;
+    uint32_t coarse = ((cOvf << 8) | cT1) << 6;
     // TCNT0 minus that is (Timer1 prescaler phase + constant) mod 256, where
     // the phase is 0..63. Centre the first sample at 128 so later ones land
     // in 65..191 and never wrap; the resulting constant offset cancels out
     // in intervals.
-    uint8_t phase = c.t0 - (uint8_t)coarse;
+    uint8_t phase = cT0 - (uint8_t)coarse;
     if (!haveFineOffset) {
       fineOffset = phase - 128;
       haveFineOffset = true;
@@ -695,10 +701,8 @@ void loop()
   }
 
   if (mode == 'd') {
-    while (burstBits < burstCapacity()) {  // ~4 ms, well within USB's limit
-      burst[burstBits >> 3] = readAdc();
-      burstBits += 8;
-    }
+    while (burstLen < burstCapacity())  // ~4 ms, well within USB's limit
+      burst[burstLen++] = readAdc();
   } else if (conditioned()) {
 #if STREAM_MODE
     uint8_t batch = mode == 'S' ? ADC_BATCH_STREAM : ADC_BATCH;
@@ -719,13 +723,13 @@ void loop()
     // output to that would hold the stream near the entropy rate, which is
     // the one thing this mode exists not to do.
     if (mode == 'S')
-      while (seedFills >= SEED_FILLS && burstBits < burstCapacity())
+      while (seedFills >= SEED_FILLS && burstLen < burstCapacity())
         maybeSqueeze();
     else
 #endif
       maybeSqueeze();
   }
 
-  if (burstBits == burstCapacity())
+  if (burstLen == burstCapacity())
     sendBurst();
 }
