@@ -32,7 +32,7 @@
 /* Must match the sketch. */
 enum { RQ_READ = 1, RQ_MODE = 2, RQ_INFO = 3, RQ_BOOT = 4 };
 enum { INFO_PROTOCOL, INFO_MODE, INFO_ASCON, INFO_INTERVALS, INFO_ADC,
-       INFO_OVERRUNS };
+       INFO_OVERRUNS, INFO_SEEDED };
 #define PROTOCOL 1
 
 #define IN  (LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE | \
@@ -42,7 +42,7 @@ enum { INFO_PROTOCOL, INFO_MODE, INFO_ASCON, INFO_INTERVALS, INFO_ADC,
 
 static const char *info_name[] = {
     "protocol", "mode", "ascon self-test", "interval source",
-    "ADC source", "overruns",
+    "ADC source", "overruns", "seeded (S mode)",
 };
 
 static volatile sig_atomic_t stop;
@@ -69,8 +69,12 @@ int main(int argc, char **argv)
             boot = 1;
         else {
             fprintf(stderr,
-                "usage: %s [--mode X|r|d] [--bytes N] [--info] [--bootloader]\n"
-                "  X  conditioned random bytes (default)\n"
+                "usage: %s [--mode X|S|r|d] [--bytes N] [--info] [--bootloader]\n"
+                "  X  conditioned random bytes, entropy-backed (default)\n"
+                "  S  the same conditioner free-running, as fast as it goes:\n"
+                "     unpredictable because Ascon is, not because every bit is\n"
+                "     backed by measured entropy. Check 'seeded' and the source\n"
+                "     flags with --info before trusting it.\n"
                 "  r  raw watchdog intervals, two bytes each, little end first\n"
                 "  d  raw ADC readings, one signed byte each\n", argv[0]);
             return 2;

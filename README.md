@@ -58,8 +58,32 @@ Send the character over the serial port, or ask for it with `rngread --mode`:
 |---|---|
 | `x` | conditioned bytes as hex, 78 digits a line (default) |
 | `X` | conditioned bytes, binary, no messages |
+| `S` | the same conditioner free-running, as fast as the chip goes |
 | `r` | raw watchdog intervals, low 16 bits of CPU cycles, binary |
 | `d` | raw ADC readings, signed bytes, binary |
+
+`S` is a different thing from `X` and the difference is the whole point of
+this project, so it is worth stating plainly. In `X` every bit is backed by
+credited entropy, and the output is unpredictable even against an adversary
+with unlimited computation. `S` keeps squeezing whether or not entropy has
+been credited for it, so its output is unpredictable *because Ascon is* -- a
+DRBG (an RBG2 construction, in SP 800-90C's terms) rather than an entropy
+source. That is the ordinary architecture of every OS random generator and
+perfectly sound; it is simply a different claim.
+
+Two things keep it honest. Nothing is emitted until the capacity has been
+seeded four times over, so a stream never comes from a state that was never
+filled; and entropy keeps being absorbed, so a compromised state heals. The
+backtracking ratchet still runs, but only where fresh entropy paid for it, so
+a captured state exposes at most one credit's worth of earlier output rather
+than the whole stream.
+
+The failure mode you must know about: **if a source dies, `S` keeps streaming
+perfect-looking bytes from a stale seed, forever and silently.** In `X` the
+rate visibly collapses. So a consumer of `S` should check the source flags and
+`seeded` (`rngread --info`) rather than trusting the stream on its own.
+Compile it out with `STREAM_MODE=0` if you would rather it not exist; it costs
+62 bytes of flash.
 
 `r` and `d` are the un-conditioned sources, for the assessment below. They
 will fail PractRand, and should: a source carrying about one bit of entropy

@@ -87,6 +87,7 @@
 #define RNG_INFO_INTERVALS  3  // 1 if the interval source still passes its health tests
 #define RNG_INFO_ADC        4  // 1 if the ADC source does
 #define RNG_INFO_OVERRUNS   5  // captures dropped because a burst was not read, saturating
+#define RNG_INFO_SEEDED     6  // 'S' mode: 1 once the capacity has been seeded
 #define RNG_PROTOCOL        1
 
 static volatile uint8_t vendorLen;    // bytes of burst waiting to be read
@@ -131,6 +132,23 @@ static uint8_t overruns;              // captures dropped waiting to be read
 #define TIMER1_OVF_CYCLES 16384L
 #define APT_WINDOW        512
 #define CREDIT_PER_OUTPUT (128 * 64)  // credited 1/64 bits per 64 output bits
+
+// 'S' mode: keep squeezing whether or not entropy has been credited for it,
+// so the rate is the chip's rather than the sources'. What comes out is then
+// unpredictable because Ascon is, not because every bit is backed by measured
+// entropy -- a DRBG (SP 800-90C calls this an RBG2 construction) rather than
+// an entropy source. Two things keep that honest:
+//   - nothing is emitted until the capacity has been seeded SEED_FILLS times
+//     over, so a stream is never served from a state that has not been filled;
+//   - entropy keeps being absorbed, so a compromised state heals.
+// The health tests still run, and 'S' will happily keep streaming from a
+// stale seed if a source dies -- which is exactly the failure that becomes
+// invisible here and is visible in 'X'. The host can see it: ask for the
+// source flags.
+#ifndef STREAM_MODE
+#define STREAM_MODE       1
+#endif
+#define SEED_FILLS        4   // x 128 credited bits into a 256-bit capacity
 #define ADC_BATCH         16          // readings between USB services
 #define STACK_CHECK       0   // 1: report never-used RAM after each 'x' line
 // 1: control build that absorbs nothing. Credits and output timing are
@@ -282,6 +300,9 @@ static uint8_t state[40];      // Ascon state: 5 little-endian 64-bit words
 static uint8_t absorbPos;      // next rate byte to absorb into
 static uint16_t credit;        // in 1/64 bit
 static bool asconOk;
+#if STREAM_MODE
+static uint8_t seedFills;      // credited fills so far, up to SEED_FILLS
+#endif
 
 static Health intervalHealth, adcHealth;
 
@@ -329,21 +350,41 @@ static void addCredit(uint8_t amount)
     credit += amount;
 }
 
-// Squeeze 64 bits into the burst once enough entropy has been credited.
+// Squeeze 64 bits into the burst once enough entropy has been credited -- or,
+// in 'S' mode once seeded, whether or not it has.
 static void maybeSqueeze()
 {
-  if (!asconOk || credit < CREDIT_PER_OUTPUT || burstBits == burstCapacity())
+  if (!asconOk || burstBits == burstCapacity())
     return;
+  bool credited = credit >= CREDIT_PER_OUTPUT;
+#if STREAM_MODE
+  if (!credited && (mode != 'S' || seedFills < SEED_FILLS))
+    return;
+#else
+  if (!credited)
+    return;
+#endif
   state[39] ^= 0x80;  // domain separation from absorbing
   ascon_permute(state, 12);
   for (uint8_t i = 0; i < 8 && burstBits < burstCapacity(); i++, burstBits += 8)
     burst[burstBits >> 3] = state[i];
-  for (uint8_t i = 0; i < 2; i++) {  // forget: 128 bits of the state zeroed
-    memset(state, 0, 8);
-    ascon_permute(state, 12);
+  if (credited) {
+    // Forget: 128 bits of the state zeroed, so earlier output cannot be
+    // recovered from a later state. Only where fresh entropy paid for it --
+    // in 'S' the free-running squeezes between two credited ones are
+    // recoverable from a captured state, and that window is one credit's
+    // worth of gathering, not the whole stream.
+    for (uint8_t i = 0; i < 2; i++) {
+      memset(state, 0, 8);
+      ascon_permute(state, 12);
+    }
+    absorbPos = 0;
+    credit = 0;
+#if STREAM_MODE
+    if (seedFills < SEED_FILLS)
+      seedFills++;
+#endif
   }
-  absorbPos = 0;
-  credit = 0;
 }
 
 static void initAscon()
@@ -432,6 +473,15 @@ static void sendBurst()
     reportStack();
 #endif
   }
+#if STREAM_MODE
+  if (mode == 'S') {
+    // No flush and no restart: discarding the samples disturbed by sending is
+    // what keeps 'X' honest about its entropy, and 'S' does not make that
+    // claim. Stopping for it would cost most of the rate the mode exists for.
+    resetOutput();
+    return;
+  }
+#endif
   SerialUSB.flush();  // sample again only once USB is quiet
   resetOutput();
   restartCapture();
@@ -453,7 +503,11 @@ extern "C" uchar digiCdcVendorSetup(usbRequest_t *rq)
     return vendorLen;
   case RNG_RQ_MODE: {
     uint8_t m = rq->wValue.bytes[0];
-    if (m == 'X' || m == 'r' || m == 'd') {
+    if (m == 'X' || m == 'r' || m == 'd'
+#if STREAM_MODE
+        || m == 'S'
+#endif
+       ) {
       mode = m;
       vendorTaken = true;        // restart under the new mode
     }
@@ -467,6 +521,9 @@ extern "C" uchar digiCdcVendorSetup(usbRequest_t *rq)
     case RNG_INFO_INTERVALS: info = !intervalHealth.failed; break;
     case RNG_INFO_ADC:       info = !adcHealth.failed; break;
     case RNG_INFO_OVERRUNS:  info = overruns; break;
+#if STREAM_MODE
+    case RNG_INFO_SEEDED:    info = seedFills >= SEED_FILLS; break;
+#endif
     default:                 return 0;
     }
     usbMsgPtr = (usbMsgPtr_t)&info;
@@ -551,7 +608,11 @@ void loop()
       firstCtrlC = millis();
     if (ctrlCs == 3)
       enterBootloader();
-    if (c == 'x' || c == 'X' || c == 'r' || c == 'd') {
+    if (c == 'x' || c == 'X' || c == 'r' || c == 'd'
+#if STREAM_MODE
+        || c == 'S'
+#endif
+       ) {
       mode = c;
       if (mode == 'x') {
         put('\r');
