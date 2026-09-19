@@ -10,8 +10,8 @@ credited. That makes it an *entropy source* rather than a random number
 generator -- about 285 bytes/s, which is the rate the sources actually
 produce, not a limit imposed by USB.
 
-A 64 MB capture passed PractRand (`RNG_stdin8`, 2^26 bytes) with no anomalies
-in 95 test results. Note what that does and does not say: any competent
+A 64 MB capture of `x` output passed PractRand (`RNG_stdin8`, 2^26 bytes) with
+no anomalies in 95 test results, over 65 hours at the entropy rate. Note what that does and does not say: any competent
 conditioner makes any input look uniform -- hash a counter and every test
 suite ever written passes -- so the statistical run tests the *plumbing*. The
 claim about the entropy rests on the SP 800-90B assessment of the raw samples
@@ -39,7 +39,9 @@ Not in the repository, because they belong to other projects: `arduino-cli`
 `build-sp800-90b.sh`), `third_party/`, `build/` and `captures/`.
 
 Needs [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) in
-`~/Arduino/libraries`.
+`~/Arduino/libraries` -- **1.4.0 or newer** for the libusb transport, which
+uses a hook that release added; the serial build works with any version. The
+Digistump AVR core provides the board.
 
 ## Typical use
 
@@ -49,6 +51,28 @@ Needs [DigiCDCFast](https://github.com/marcocarnut/DigiCDCFast) in
 
 Board: micronucleus 2.6 bootloader (6650 bytes free). If no sketch is running,
 `flash.sh` waits 60 s for the board to be plugged in.
+
+## Build options
+
+Pass them through `EXTRA_FLAGS`, as in
+`EXTRA_FLAGS="-DRNG_VENDOR=1" tools/build.sh`.
+
+| option | | |
+|---|---|---|
+| `RNG_VENDOR` | 0 | 1: vendor control transfers instead of the serial port (see *Two transports*) |
+| `STREAM_MODE` | 1 | 0: no `S` mode, 130 bytes less flash |
+| `RNG_CDC_ECHO` | `RNG_VENDOR` | 1: echo the serial port back, to prove it still works while the bytes go out over libusb |
+| `ADC_BATCH` | 16 | ADC readings between USB services. Tuned; the transmitter's timing was measured with it |
+| `STACK_CHECK` | 0 | 1: report never-used RAM after each `x` line |
+
+Sizes on the Digispark, of the 6650 bytes micronucleus leaves and 512 of RAM:
+
+| build | flash | RAM |
+|---|---|---|
+| default | 6062 | 382 |
+| `STREAM_MODE=0` | 5932 | 381 |
+| `RNG_VENDOR=1` | 5924 | 387 |
+| both | 5762 | 386 |
 
 ## Modes
 
@@ -83,7 +107,7 @@ perfect-looking bytes from a stale seed, forever and silently.** In `X` the
 rate visibly collapses. So a consumer of `S` should check the source flags and
 `seeded` (`rngread --info`) rather than trusting the stream on its own.
 Compile it out with `STREAM_MODE=0` if you would rather it not exist; it costs
-148 bytes of flash.
+130 bytes of flash.
 
 Measured: **5650 bytes/s**, twenty times `X`'s 284, against a theoretical
 8000 that low-speed USB allows with 8-byte packets. The permutation is not
@@ -141,7 +165,8 @@ rngtacho session, on a device that had quietly switched itself to `r`.)
 
   In vendor builds the diagnostics that `x` mode prints as `#` comments become
   requests instead (`rngread --info`): protocol, mode, the Ascon self-test,
-  and whether each source still passes its health tests.
+  whether each source still passes its health tests, bursts dropped because
+  nobody read them, and whether `S` mode has been seeded.
 
 Both transports measure the same 285 bytes/s, so the choice costs nothing.
 
