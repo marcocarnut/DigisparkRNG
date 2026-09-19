@@ -477,8 +477,21 @@ static void sendBurst()
     // A block at a time, not a byte: write(uint8_t) waits for the host and
     // services USB on every call, which costs more than the byte is worth
     // when a whole burst is ready.
-    for (uint8_t sent = 0; sent < bytes; )
-      sent += SerialUSB.write(burst + sent, bytes - sent);
+    //
+    // Stop at a short write rather than retrying it. write() returns 0 once
+    // the host has stopped draining, and looping on that never ends: loop()
+    // is never re-entered, so the three Ctrl-Cs into the bootloader are never
+    // read. At 284 bytes/s the host nearly always drains in time and it never
+    // showed; at 5650 it wedges the first time a tool writes to the port
+    // without reading it, which is exactly what tools/stump.py does to ask
+    // for the bootloader. Dropping the rest of a burst costs nothing -- one
+    // burst of random bytes is as good as another.
+    for (uint8_t sent = 0; sent < bytes; ) {
+      uint8_t n = SerialUSB.write(burst + sent, bytes - sent);
+      if (!n)
+        break;
+      sent += n;
+    }
   } else {
     for (uint8_t i = 0; i < bytes; i++) {
       putNibble(burst[i] >> 4);
