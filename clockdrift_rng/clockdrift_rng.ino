@@ -149,7 +149,13 @@ static uint8_t overruns;              // captures dropped waiting to be read
 #define STREAM_MODE       1
 #endif
 #define SEED_FILLS        4   // x 128 credited bits into a 256-bit capacity
+#ifndef ADC_BATCH
 #define ADC_BATCH         16          // readings between USB services
+#endif
+// 'S' services USB far more often: a conversion is about 100 us and the host
+// takes 8 bytes a frame, so sampling in sixteens leaves the pipe idle half
+// the time. 16 -> 4 measured 3900 -> 5200 bytes/s, and 2 -> 5660; 1 gains nothing.
+#define ADC_BATCH_STREAM  2
 #define STACK_CHECK       0   // 1: report never-used RAM after each 'x' line
 // 1: control build that absorbs nothing. Credits and output timing are
 // unchanged, but the output must then repeat identically after every reboot,
@@ -281,6 +287,10 @@ static uint16_t burstBits;
 
 static bool conditioned()
 {
+#if STREAM_MODE
+  if (mode == 'S')
+    return true;
+#endif
   return mode == 'x' || mode == 'X';
 }
 
@@ -459,9 +469,16 @@ static void sendBurst()
     put(bytes);
     for (uint8_t i = 0; i < bytes; i++)
       put(burst[i]);
-  } else if (mode == 'X') {
-    for (uint8_t i = 0; i < bytes; i++)
-      put(burst[i]);
+  } else if (mode == 'X'
+#if STREAM_MODE
+             || mode == 'S'
+#endif
+            ) {
+    // A block at a time, not a byte: write(uint8_t) waits for the host and
+    // services USB on every call, which costs more than the byte is worth
+    // when a whole burst is ready.
+    for (uint8_t sent = 0; sent < bytes; )
+      sent += SerialUSB.write(burst + sent, bytes - sent);
   } else {
     for (uint8_t i = 0; i < bytes; i++) {
       putNibble(burst[i] >> 4);
@@ -670,7 +687,12 @@ void loop()
       burstBits += 8;
     }
   } else if (conditioned()) {
-    for (uint8_t i = 0; i < ADC_BATCH; i++) {
+#if STREAM_MODE
+    uint8_t batch = mode == 'S' ? ADC_BATCH_STREAM : ADC_BATCH;
+#else
+    const uint8_t batch = ADC_BATCH;
+#endif
+    for (uint8_t i = 0; i < batch; i++) {
       uint8_t sample = readAdc();
       absorb(sample);
       if (ADC_CREDIT &&
@@ -678,7 +700,17 @@ void loop()
                   PSTR("adc health test failed")))
         addCredit(ADC_CREDIT);
     }
-    maybeSqueeze();
+#if STREAM_MODE
+    // 'S' fills the burst here rather than taking one squeeze per batch of
+    // samples: the batch is 16 ADC conversions, about 1.6 ms, and pacing the
+    // output to that would hold the stream near the entropy rate, which is
+    // the one thing this mode exists not to do.
+    if (mode == 'S')
+      while (seedFills >= SEED_FILLS && burstBits < burstCapacity())
+        maybeSqueeze();
+    else
+#endif
+      maybeSqueeze();
   }
 
   if (burstBits == burstCapacity())

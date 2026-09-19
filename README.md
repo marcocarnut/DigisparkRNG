@@ -58,7 +58,7 @@ Send the character over the serial port, or ask for it with `rngread --mode`:
 |---|---|
 | `x` | conditioned bytes as hex, 78 digits a line (default) |
 | `X` | conditioned bytes, binary, no messages |
-| `S` | the same conditioner free-running, as fast as the chip goes |
+| `S` | the same conditioner free-running, 5650 bytes/s |
 | `r` | raw watchdog intervals, low 16 bits of CPU cycles, binary |
 | `d` | raw ADC readings, signed bytes, binary |
 
@@ -83,7 +83,18 @@ perfect-looking bytes from a stale seed, forever and silently.** In `X` the
 rate visibly collapses. So a consumer of `S` should check the source flags and
 `seeded` (`rngread --info`) rather than trusting the stream on its own.
 Compile it out with `STREAM_MODE=0` if you would rather it not exist; it costs
-62 bytes of flash.
+148 bytes of flash.
+
+Measured: **5650 bytes/s**, twenty times `X`'s 284, against a theoretical
+8000 that low-speed USB allows with 8-byte packets. The permutation is not
+what stops it -- raw `d` mode, with no Ascon at all, reaches 3800 by the same
+path. What is left is the shape of the sending: the sketch fills a 39-byte
+burst, sends it in five USB frames and then goes quiet, so the pipe idles
+between bursts. Keeping it full would want the output topped up continuously
+rather than in bursts, which is a larger change than the remaining 2 kB/s is
+worth. `S` also samples the ADC in twos rather than sixteens, since a
+conversion is about 100 us and sampling in sixteens left the pipe idle half
+the time (3900 -> 5650 bytes/s); `X`'s sampling cadence is untouched.
 
 `r` and `d` are the un-conditioned sources, for the assessment below. They
 will fail PractRand, and should: a source carrying about one bit of entropy

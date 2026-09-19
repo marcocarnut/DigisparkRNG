@@ -156,6 +156,7 @@ int main(int argc, char **argv)
      * and sleep through most of it, then look often for the short remainder.
      * Both numbers come down: fewer requests, and less waiting. */
     long period_us = 150000;        /* first guess, refined below */
+    int waited = 0;                 /* empty polls since the last data */
     struct timespec last;
     clock_gettime(CLOCK_MONOTONIC, &last);
 
@@ -171,6 +172,7 @@ int main(int argc, char **argv)
             goto fail;
         }
         if (r == 0) {
+            waited = 1;
             usleep(4000);           /* the short remainder: look often */
             if (++quiet == 2500) {  /* ten seconds */
                 fprintf(stderr, "rngread: no data for 10 s; check --info\n");
@@ -185,8 +187,16 @@ int main(int argc, char **argv)
         long delta_us = (now.tv_sec - last.tv_sec) * 1000000L
                       + (now.tv_nsec - last.tv_nsec) / 1000;
         last = now;
-        if (delta_us > 1000 && delta_us < 10000000L)
+        if (!waited) {
+            /* Data was already there when we woke: the nap was too long, and
+             * the delta cannot say by how much because it contains the nap.
+             * Cut it back until we start having to wait again. A stream mode
+             * drives this to nothing, which is what it should do. */
+            period_us -= period_us / 4;
+        } else if (delta_us > 1000 && delta_us < 10000000L) {
             period_us += (delta_us - period_us) / 4;   /* settles in a few bursts */
+        }
+        waited = 0;
         if (limit && total + r > limit)
             r = (int)(limit - total);
         if (fwrite(buf, 1, (size_t)r, stdout) != (size_t)r) {
