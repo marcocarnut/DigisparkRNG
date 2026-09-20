@@ -267,11 +267,27 @@ static void enterBootloader()
 #if RNG_UART
 
 #ifndef RNG_UART_BAUD
-#define RNG_UART_BAUD 9600   // 9600 rides the internal RC's error comfortably;
-#endif                       // higher rates want a real-hardware check
+#define RNG_UART_BAUD 9600   // 9600 is safe on the internal RC; 115200 works in
+#endif                       // Wokwi (8 MHz) and wants a scope check on hardware
 #define UART_TX  PB1         // also the Digispark LED: it flickers as it sends
 #define UART_RX  PB0
-#define UART_BIT_US (1000000.0 / RNG_UART_BAUD)
+
+// Each bit is exactly one bit period of CPU cycles. The delay is counted in
+// cycles and the loop's own overhead subtracted, so it holds at 115200 on an
+// 8 MHz part (~69 cycles a bit, where the overhead is most of the difference)
+// as well as at 9600 (~1700, where it is noise). F_CPU/baud adapts to whatever
+// clock the build uses. The overheads are the non-delay cycles of one loop
+// pass, read from the disassembly; tune them if a receiver shows framing error.
+#define UART_BIT_CYCLES (F_CPU / RNG_UART_BAUD)
+#ifndef UART_TX_OVERHEAD
+#define UART_TX_OVERHEAD 10
+#endif
+#ifndef UART_RX_OVERHEAD
+#define UART_RX_OVERHEAD 9
+#endif
+#ifndef UART_RX_START_OVERHEAD
+#define UART_RX_START_OVERHEAD 25  // interrupt latency + prologue + the start test
+#endif
 
 // Received bytes wait here for loop() -- a keystroke or two, never a stream.
 static volatile uint8_t uartRx[4];
@@ -284,19 +300,15 @@ static void txByte(uint8_t c)
 {
   uint8_t s = SREG;
   cli();
-  PORTB &= ~_BV(UART_TX);           // start bit
-  _delay_us(UART_BIT_US);
-  for (uint8_t i = 0; i < 8; i++) {
-    if (c & 1)
-      PORTB |= _BV(UART_TX);
-    else
-      PORTB &= ~_BV(UART_TX);
-    c >>= 1;
-    _delay_us(UART_BIT_US);
+  uint16_t frame = ((uint16_t)c << 1) | 0x200;  // start bit (0), 8 data, stop (1)
+  for (uint8_t i = 0; i < 10; i++) {
+    // Branchless, so every bit takes the same cycles whatever its value -- a
+    // data-dependent branch would jitter the bit width, which shows at 115200.
+    PORTB = (PORTB & ~_BV(UART_TX)) | ((uint8_t)(frame & 1) << UART_TX);
+    frame >>= 1;
+    __builtin_avr_delay_cycles(UART_BIT_CYCLES - UART_TX_OVERHEAD);
   }
-  PORTB |= _BV(UART_TX);            // stop bit, then idle high
-  _delay_us(UART_BIT_US);
-  SREG = s;
+  SREG = s;                          // line left idle high on the stop bit
 }
 
 // A start bit's falling edge on PB0 lands here (the only pin-change source
@@ -307,12 +319,13 @@ ISR(PCINT0_vect)
 {
   if (PINB & _BV(UART_RX))          // a rising edge, or noise: not a start bit
     return;
-  _delay_us(UART_BIT_US * 1.5);     // to the middle of bit 0
+  __builtin_avr_delay_cycles(UART_BIT_CYCLES + UART_BIT_CYCLES / 2 - UART_RX_START_OVERHEAD);
   uint8_t b = 0;
   for (uint8_t i = 0; i < 8; i++) {
-    if (PINB & _BV(UART_RX))
-      b |= 1 << i;
-    _delay_us(UART_BIT_US);
+    // Shift the new bit in at the top -- constant time, where `b |= 1 << i`
+    // would take longer for higher bits and jitter the sampling at 115200.
+    b = (b >> 1) | (((PINB >> UART_RX) & 1) << 7);  // 8N1, least significant first
+    __builtin_avr_delay_cycles(UART_BIT_CYCLES - UART_RX_OVERHEAD);
   }
   uint8_t next = (uartRxHead + 1) & 3;
   if (next != uartRxTail) {         // drop it rather than overwrite an unread one
