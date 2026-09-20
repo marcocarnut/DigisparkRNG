@@ -44,9 +44,23 @@
   Because of Timer0, analogWrite() on pins 0 and 1 must not be used.
 
   Sending Ctrl-C three times in a row (within 2 s) reboots into the bootloader.
+
+  Transport: the random bytes leave over USB (DigiCDCFast) by default, or over
+  a plain 8N1 UART on PB1 (TX) / PB0 (RX) when built with RNG_UART -- no USB at
+  all, so it runs on any board and under a simulator, and reads on a terminal
+  or feeds another microcontroller's UART. See the RNG_UART block below.
 */
 
+// Transport, chosen before the includes because RNG_UART removes V-USB.
+#ifndef RNG_UART
+#define RNG_UART 0     // 1: a bit-banged UART on PB1/PB0 instead of USB
+#endif
+
+#if RNG_UART
+#include <util/delay.h>
+#else
 #include <DigiCDCFast.h>
+#endif
 #include <avr/wdt.h>
 
 // Transport for the random bytes.
@@ -70,6 +84,9 @@
 
 #if RNG_VENDOR && !USB_CFG_VENDOR_HOOK
 #error "RNG_VENDOR needs USB_CFG_VENDOR_HOOK in DigiCDCFast's usbconfig.h"
+#endif
+#if RNG_UART && RNG_VENDOR
+#error "RNG_UART and RNG_VENDOR are two transports; pick one"
 #endif
 
 #if RNG_VENDOR
@@ -102,10 +119,14 @@ static uint8_t overruns;              // captures dropped waiting to be read
 //  'r': raw consecutive intervals in CPU cycles, low 16 bits (binary).
 //  'd': raw consecutive ADC readings as signed bytes (binary).
 // Binary bursts are framed as 0xA5, mode character, byte count, data.
+// The mode at power-up; override it to observe a particular one without a
+// terminal (a simulator, or a fixed-purpose standalone device).
+#ifndef DEFAULT_MODE
 #if RNG_VENDOR
 #define DEFAULT_MODE      'X'  // no hex over libusb: the host formats
 #else
-#define DEFAULT_MODE      'x'
+#define DEFAULT_MODE      'x'  // human-readable on a plain terminal
+#endif
 #endif
 
 // Entropy credit per sample, in 1/64 bit; 0 disables crediting a source.
@@ -232,10 +253,99 @@ static void enterBootloader()
   ((void (*)())0)();
 }
 
+// ----------------------------------------------------------------- transport
+// The random bytes and the mode commands go through five calls: txBegin,
+// txByte, txFlush, rxAvail, rxRead. Over USB they are DigiCDCFast; over the
+// UART they are the bit-banged code below.
+#if RNG_UART
+
+#ifndef RNG_UART_BAUD
+#define RNG_UART_BAUD 9600   // 9600 rides the internal RC's error comfortably;
+#endif                       // higher rates want a real-hardware check
+#define UART_TX  PB1         // also the Digispark LED: it flickers as it sends
+#define UART_RX  PB0
+#define UART_BIT_US (1000000.0 / RNG_UART_BAUD)
+
+// Received bytes wait here for loop() -- a keystroke or two, never a stream.
+static volatile uint8_t uartRx[4];
+static volatile uint8_t uartRxHead, uartRxTail;
+
+// A whole byte is bit-banged with interrupts off, so it cannot be stretched by
+// the watchdog interrupt into a framing error. The samples the watchdog would
+// have taken meanwhile are discarded after the send anyway (see sendBurst).
+static void txByte(uint8_t c)
+{
+  uint8_t s = SREG;
+  cli();
+  PORTB &= ~_BV(UART_TX);           // start bit
+  _delay_us(UART_BIT_US);
+  for (uint8_t i = 0; i < 8; i++) {
+    if (c & 1)
+      PORTB |= _BV(UART_TX);
+    else
+      PORTB &= ~_BV(UART_TX);
+    c >>= 1;
+    _delay_us(UART_BIT_US);
+  }
+  PORTB |= _BV(UART_TX);            // stop bit, then idle high
+  _delay_us(UART_BIT_US);
+  SREG = s;
+}
+
+// A start bit's falling edge on PB0 lands here (the only pin-change source
+// enabled). The whole byte is read inline, interrupts off, sampling the middle
+// of each bit. It runs only while a command is being typed, so its ~1 ms cost
+// to the entropy timing is rare and harmless.
+ISR(PCINT0_vect)
+{
+  if (PINB & _BV(UART_RX))          // a rising edge, or noise: not a start bit
+    return;
+  _delay_us(UART_BIT_US * 1.5);     // to the middle of bit 0
+  uint8_t b = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (PINB & _BV(UART_RX))
+      b |= 1 << i;
+    _delay_us(UART_BIT_US);
+  }
+  uint8_t next = (uartRxHead + 1) & 3;
+  if (next != uartRxTail) {         // drop it rather than overwrite an unread one
+    uartRx[uartRxHead] = b;
+    uartRxHead = next;
+  }
+  GIFR = _BV(PCIF);                 // edges during the read set this; clear it
+}
+
+static void txBegin()
+{
+  PORTB |= _BV(UART_TX) | _BV(UART_RX);  // TX idle high; RX pull-up
+  DDRB |= _BV(UART_TX);                   // TX output, RX stays input
+  PCMSK = _BV(UART_RX);                   // pin-change only on RX
+  GIFR = _BV(PCIF);
+  GIMSK |= _BV(PCIE);
+}
+
+static bool rxAvail() { return uartRxHead != uartRxTail; }
+static uint8_t rxRead()
+{
+  uint8_t c = uartRx[uartRxTail];
+  uartRxTail = (uartRxTail + 1) & 3;
+  return c;
+}
+static void txFlush() {}  // txByte returns only once the byte is on the wire
+
+#else  // USB transport
+
+static void txBegin()          { SerialUSB.begin(); }
+static void txByte(uint8_t c)  { while (!SerialUSB.write(c)); }
+static void txFlush()          { SerialUSB.flush(); }
+static bool rxAvail()          { return SerialUSB.available(); }
+static uint8_t rxRead()        { return SerialUSB.read(); }
+
+#endif
+
 static void put(uint8_t c)
 {
-  while (!SerialUSB.write(c))  // write() drops the char when the buffer is full
-    ;
+  txByte(c);  // blocks until the byte is sent (USB: until the buffer has room)
 }
 
 static void putNibble(uint8_t n)
@@ -482,6 +592,10 @@ static void sendBurst()
              || mode == 'S'
 #endif
             ) {
+#if RNG_UART
+    for (uint8_t i = 0; i < bytes; i++)
+      put(burst[i]);              // the UART blocks per byte; nothing to batch
+#else
     // A block at a time, not a byte: write(uint8_t) waits for the host and
     // services USB on every call, which costs more than the byte is worth
     // when a whole burst is ready.
@@ -500,6 +614,7 @@ static void sendBurst()
         break;
       sent += n;
     }
+#endif
   } else {
     for (uint8_t i = 0; i < bytes; i++) {
       putNibble(burst[i] >> 4);
@@ -520,7 +635,7 @@ static void sendBurst()
     return;
   }
 #endif
-  SerialUSB.flush();  // sample again only once USB is quiet
+  txFlush();  // sample again only once the port is quiet
   resetOutput();
   restartCapture();
 #endif
@@ -576,7 +691,7 @@ extern "C" uchar digiCdcVendorSetup(usbRequest_t *rq)
 
 void setup()
 {
-  SerialUSB.begin();
+  txBegin();
 
   initAscon();
   if (!asconOk)
@@ -638,8 +753,8 @@ void loop()
   if (vendorLen)
     return;  // a burst is waiting to be read: take no samples meanwhile
 #else
-  if (SerialUSB.available()) {  // also services USB
-    char c = SerialUSB.read();
+  if (rxAvail()) {  // CDC: also services USB. UART: a byte the PCINT read
+    char c = rxRead();
     if (c != 3)
       ctrlCs = 0;
     else if (ctrlCs++ == 0)

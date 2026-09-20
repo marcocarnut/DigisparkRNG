@@ -59,7 +59,10 @@ Pass them through `EXTRA_FLAGS`, as in
 
 | option | | |
 |---|---|---|
-| `RNG_VENDOR` | 0 | 1: vendor control transfers instead of the serial port (see *Two transports*) |
+| `RNG_VENDOR` | 0 | 1: vendor control transfers instead of the serial port (see *Transports*) |
+| `RNG_UART` | 0 | 1: a plain UART on PB1/PB0 instead of USB (see *Transports*) |
+| `RNG_UART_BAUD` | 9600 | UART baud; higher wants a real-hardware timing check |
+| `DEFAULT_MODE` | `x`/`X` | the power-up mode, to fix a build to one output without a terminal |
 | `STREAM_MODE` | 1 | 0: no `S` mode, 130 bytes less flash |
 | `RNG_CDC_ECHO` | `RNG_VENDOR` | 1: echo the serial port back, to prove it still works while the bytes go out over libusb |
 | `ADC_BATCH` | 16 | ADC readings between USB services. Tuned; the transmitter's timing was measured with it |
@@ -69,10 +72,12 @@ Sizes on the Digispark, of the 6650 bytes micronucleus leaves and 512 of RAM:
 
 | build | flash | RAM |
 |---|---|---|
-| default | 6014 | 372 |
+| default (USB CDC) | 6014 | 372 |
 | `STREAM_MODE=0` | 5884 | 371 |
 | `RNG_VENDOR=1` | 5880 | 377 |
-| both | 5718 | 376 |
+| `RNG_UART=1` | 3390 | 151 |
+
+The UART build is half the size because it carries no USB stack at all.
 
 ## Modes
 
@@ -140,17 +145,17 @@ unnoticed for so long.
 that sets raw mode itself. A `cat` or a plain `open()` is not. (Found by the
 rngtacho session, on a device that had quietly switched itself to `r`.)
 
-## Two transports
+## Transports
 
-`RNG_VENDOR` chooses how the bytes leave the chip:
+Three ways the bytes leave the chip, chosen at build time:
 
-- **0 (default)**: the USB serial port, read with any terminal or with
+- **USB CDC serial** (default): a serial port, read with any terminal or with
   `stump.py`.
-- **1**: vendor control requests on endpoint 0, read with `tools/rngread.c`
-  and libusb. The serial port stays enumerated and completely unused, so
-  another function of the same sketch can have it -- this chip's USB driver
-  has no endpoint to spare for a second one. Needs `USB_CFG_VENDOR_HOOK` set
-  to 1 in DigiCDCFast's `src/usbconfig.h`.
+- **USB vendor requests** (`RNG_VENDOR=1`): control requests on endpoint 0,
+  read with `tools/rngread.c` and libusb. The serial port stays enumerated and
+  completely unused, so another function of the same sketch can have it -- this
+  chip's USB driver has no endpoint to spare for a second one. Needs
+  `USB_CFG_VENDOR_HOOK` set to 1 in DigiCDCFast's `src/usbconfig.h`.
 
         EXTRA_FLAGS="-DRNG_VENDOR=1 -DUSB_CFG_VENDOR_HOOK=1" tools/build.sh
         cc -O2 -o tools/rngread tools/rngread.c -lusb-1.0
@@ -168,7 +173,27 @@ rngtacho session, on a device that had quietly switched itself to `r`.)
   whether each source still passes its health tests, bursts dropped because
   nobody read them, and whether `S` mode has been seeded.
 
-Both transports measure the same 285 bytes/s, so the choice costs nothing.
+**A plain UART**, with `RNG_UART=1`: 8N1 on PB1 (TX) and PB0 (RX), no USB. It
+reads on any terminal through a USB-serial cable, or feeds another
+microcontroller's UART directly -- the RNG as a serial entropy peripheral, with
+no host that has to speak CDC. Modes switch and Ctrl-C reaches the bootloader
+over RX exactly as over USB. Two things to know:
+
+- **Timing.** The 16.5 MHz clock is held precise, in the USB builds, by tuning
+  against the USB frame; a UART build has no such reference and rides the
+  internal RC oscillator's error, which drifts with temperature. 9600 (the
+  default) tolerates that comfortably; higher `RNG_UART_BAUD` wants checking on
+  real hardware.
+- **Half duplex.** A byte is transmitted with interrupts off so the watchdog
+  cannot stretch it into a framing error, which means the port is deaf while a
+  burst goes out. Typed commands land in the gaps between bursts -- fine for
+  `x`/`X`, but leaving `S` (which streams almost continuously) may take a reset.
+  And each received byte is a ~1 ms interrupts-off window that can perturb one
+  interval sample: rare, and only while you are typing, but it is literally the
+  act of talking to the RNG nudging the jitter it measures.
+
+The USB transports both measure the same 285 bytes/s; the UART's throughput is
+set by its baud (960 bytes/s at 9600), well above the entropy rate.
 
 ## Assessing the entropy
 
