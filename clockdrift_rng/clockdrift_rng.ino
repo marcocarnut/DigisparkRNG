@@ -183,7 +183,14 @@ static uint8_t overruns;              // captures dropped waiting to be read
 // showing that the unpredictability comes from the samples, not from Ascon.
 #define NO_ENTROPY_CONTROL 0
 
-extern "C" volatile unsigned long millis_timer_overflow_count;  // wiring.c
+// The Digispark core runs millis() on Timer1 and exposes its overflow count
+// here; the interval timestamp reads it. A weak definition lets the sketch
+// also link against a core that does not (a simulator, or a plain ATtiny
+// core), where nothing drives it and the interval timestamps are degenerate.
+// That is harmless where it happens: such an environment has no jitter for
+// them to carry, and the health tests see the constant and refuse to credit
+// it. On the real Digispark the core's strong definition wins.
+extern "C" { volatile unsigned long millis_timer_overflow_count __attribute__((weak)); }
 extern "C" void ascon_permute(uint8_t *state, uint8_t rounds);  // ascon_permute.S
 
 struct Health {       // SP 800-90B health test state for one source
