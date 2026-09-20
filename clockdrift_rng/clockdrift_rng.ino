@@ -118,7 +118,10 @@ static uint8_t overruns;              // captures dropped waiting to be read
 //  'X': conditioned random bytes (binary, no messages).
 //  'r': raw consecutive intervals in CPU cycles, low 16 bits (binary).
 //  'd': raw consecutive ADC readings as signed bytes (binary).
-// Binary bursts are framed as 0xA5, mode character, byte count, data.
+//  'R': the intervals as hex, for reading on a terminal (a simulator).
+//  'D': the ADC readings as hex, likewise.
+// Binary bursts ('X','r','d','S') are framed as 0xA5, mode, byte count, data;
+// the assessment tools read 'r'/'d'. The hex modes are for eyes, not tools.
 // The mode at power-up; override it to observe a particular one without a
 // terminal (a simulator, or a fixed-purpose standalone device).
 #ifndef DEFAULT_MODE
@@ -429,9 +432,17 @@ static bool conditioned()
   return mode == 'x' || mode == 'X';
 }
 
-static uint8_t burstCapacity()  // in bytes: whole intervals in 'r'
+// The raw modes come in two spellings: lowercase binary (r, d) for the
+// assessment tools, uppercase hex (R, D) for reading on a plain terminal.
+// Each samples the same source; only the output format differs.
+static bool rawIntervals() { return mode == 'r' || mode == 'R'; }
+static bool rawAdc()       { return mode == 'd' || mode == 'D'; }
+// Which output is hex: conditioned 'x', and the two uppercase raw modes.
+static bool outputHex()    { return mode == 'x' || mode == 'R' || mode == 'D'; }
+
+static uint8_t burstCapacity()  // in bytes: whole intervals in r/R
 {
-  return mode == 'r' ? BURST_BYTES / 2 * 2 : BURST_BYTES;
+  return rawIntervals() ? BURST_BYTES / 2 * 2 : BURST_BYTES;
 }
 
 static void resetOutput()
@@ -567,7 +578,7 @@ static void processInterval(uint16_t interval)  // the low 16 bits
         healthy(intervalHealth, interval, INTERVAL_RCT_CUTOFF,
                 INTERVAL_APT_CUTOFF, PSTR("interval health test failed")))
       addCredit(INTERVAL_CREDIT);
-  } else if (mode == 'r') {
+  } else if (rawIntervals()) {
     if (burstLen < burstCapacity()) {
       burst[burstLen++] = interval >> 8;
       burst[burstLen++] = interval;
@@ -601,7 +612,19 @@ static void sendBurst()
   // hundreds of milliseconds against the transfer's few.)
   vendorLen = bytes;
 #else
-  if (mode == 'r' || mode == 'd') {
+  if (outputHex()) {
+    // 'x' (conditioned) and the raw hex modes 'R'/'D' all print two hex digits
+    // a byte and end the line -- readable on any terminal.
+    for (uint8_t i = 0; i < bytes; i++) {
+      putNibble(burst[i] >> 4);
+      putNibble(burst[i] & 15);
+    }
+    put('\r');
+    put('\n');
+#if STACK_CHECK
+    reportStack();
+#endif
+  } else if (mode == 'r' || mode == 'd') {
     put(0xA5);
     put(mode);
     put(bytes);
@@ -634,16 +657,6 @@ static void sendBurst()
         break;
       sent += n;
     }
-#endif
-  } else {
-    for (uint8_t i = 0; i < bytes; i++) {
-      putNibble(burst[i] >> 4);
-      putNibble(burst[i] & 15);
-    }
-    put('\r');
-    put('\n');
-#if STACK_CHECK
-    reportStack();
 #endif
   }
 #if STREAM_MODE
@@ -781,7 +794,7 @@ void loop()
       firstCtrlC = millis();
     if (ctrlCs == 3)
       enterBootloader();
-    if (c == 'x' || c == 'X' || c == 'r' || c == 'd'
+    if (c == 'x' || c == 'X' || c == 'r' || c == 'd' || c == 'R' || c == 'D'
 #if STREAM_MODE
         || c == 'S'
 #endif
@@ -839,7 +852,7 @@ void loop()
     stamp[1] = timestamp;
   }
 
-  if (mode == 'd') {
+  if (rawAdc()) {
     while (burstLen < burstCapacity())  // ~4 ms, well within USB's limit
       burst[burstLen++] = readAdc();
   } else if (conditioned()) {

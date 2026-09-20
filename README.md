@@ -90,6 +90,8 @@ Send the character over the serial port, or ask for it with `rngread --mode`:
 | `S` | the same conditioner free-running, 5650 bytes/s |
 | `r` | raw watchdog intervals, low 16 bits of CPU cycles, binary |
 | `d` | raw ADC readings, signed bytes, binary |
+| `R` | the intervals as hex, for reading on a terminal |
+| `D` | the ADC readings as hex |
 
 `S` is a different thing from `X` and the difference is the whole point of
 this project, so it is worth stating plainly. In `X` every bit is backed by
