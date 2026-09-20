@@ -423,8 +423,25 @@ static void txFlush() {}  // txByte returns only once the byte is on the wire
 
 #else  // USB transport
 
+static bool streaming();       // defined below; needed by txByte
+static bool txDropped;         // a stream write hit a stalled reader this burst
+
 static void txBegin()          { SerialUSB.begin(); }
-static void txByte(uint8_t c)  { while (!SerialUSB.write(c)); }
+// A stalled reader must never wedge the free-running stream. If it did, loop()
+// would stop being re-entered -- the LED would freeze and the three Ctrl-Cs
+// into the bootloader would never be read. So in a streaming mode we drop the
+// rest of the burst on the first short write, exactly as the binary 'S' path
+// does (one burst of random bytes is as good as another); 'x' and the raw
+// modes still block, so their credited or finite output is never lost.
+static void txByte(uint8_t c)
+{
+  if (streaming()) {
+    if (!txDropped && !SerialUSB.write(c))
+      txDropped = true;
+  } else {
+    while (!SerialUSB.write(c));
+  }
+}
 static void txFlush()          { SerialUSB.flush(); }
 static bool rxAvail()          { return SerialUSB.available(); }
 static uint8_t rxRead()        { return SerialUSB.read(); }
@@ -677,6 +694,9 @@ static void sendBurst()
   // hundreds of milliseconds against the transfer's few.)
   vendorLen = bytes;
 #else
+#if !RNG_UART
+  txDropped = false;   // fresh drop budget for this burst (CDC stream only)
+#endif
   if (outputHex()) {
     // 'x' (conditioned) and the raw hex modes 'R'/'D' all print two hex digits
     // a byte and end the line -- readable on any terminal.
