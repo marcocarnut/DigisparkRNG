@@ -74,6 +74,14 @@
 #include <DigiCDCFast.h>
 #endif
 #include <avr/wdt.h>
+#include <avr/eeprom.h>
+
+// Remember the last mode across power cycles in EEPROM byte 0, so a device
+// keeps whatever it was set to. Erased EEPROM (0xFF) means "never set" and
+// becomes the default. 0 disables it: the mode is always DEFAULT_MODE.
+#ifndef MODE_EEPROM
+#define MODE_EEPROM 1
+#endif
 
 // Transport for the random bytes.
 //   0: a line (or a binary burst) on the USB serial port, read with any
@@ -128,12 +136,13 @@ static uint8_t overruns;              // captures dropped waiting to be read
 // Output mode, switchable at runtime by sending the character over serial.
 // Lowercase is hex text (readable on a terminal); uppercase is binary.
 //  'x' / 'X': conditioned random bytes, hex / binary.
-//  'S':       conditioned, free-running at the chip's rate (binary; the
-//             default). Streams for a program, so there is no hex 's'.
+//  's' / 'S': conditioned, free-running at the chip's rate, hex / binary.
+//             's' is the default -- readable hex a terminal shows on plug-in.
 //  'r' / 'R': raw watchdog intervals, low 16 bits of CPU cycles, hex / binary.
 //  'd' / 'D': raw ADC readings, signed bytes, hex / binary.
 // Binary bursts (X, S, R, D) are framed as 0xA5, mode, byte count, data; the
 // assessment tools read the uppercase R and D. Hex is for eyes, not tools.
+// The mode is remembered in EEPROM across power cycles (see MODE_EEPROM).
 // The mode at power-up; override it to fix a build to one output without a
 // terminal (a simulator, or a standalone device).
 #ifndef STREAM_MODE
@@ -143,9 +152,9 @@ static uint8_t overruns;              // captures dropped waiting to be read
 #if RNG_VENDOR
 #define DEFAULT_MODE      'X'  // the host formats; libusb reads bursts
 #elif STREAM_MODE
-#define DEFAULT_MODE      'S'  // stream binary at full rate once seeded
+#define DEFAULT_MODE      's'  // hex stream: what a terminal shows first
 #else
-#define DEFAULT_MODE      'X'  // binary conditioned, when there is no stream
+#define DEFAULT_MODE      'x'  // hex conditioned, when there is no stream
 #endif
 #endif
 
@@ -222,6 +231,44 @@ struct Health {       // SP 800-90B health test state for one source
 
 static char mode = DEFAULT_MODE;
 static bool producing;    // has validated entropy and squeezed at least once
+
+// A legal mode letter (STREAM_MODE gates 's'/'S'). Used to reject a corrupt or
+// erased EEPROM byte on boot.
+static bool validMode(char c)
+{
+  if (c == 'x' || c == 'X' || c == 'r' || c == 'R' || c == 'd' || c == 'D')
+    return true;
+#if STREAM_MODE
+  if (c == 's' || c == 'S')
+    return true;
+#endif
+  return false;
+}
+
+#if MODE_EEPROM
+static char persistedMode;   // last value known to be in EEPROM byte 0
+// Boot: adopt the stored mode; an erased (0xFF) or corrupt byte becomes the
+// default and is written back. loop() then writes any later change once.
+static void restoreMode()
+{
+  char c = (char)eeprom_read_byte((const uint8_t *)0);
+  if (!validMode(c))
+    c = DEFAULT_MODE;
+  mode = c;
+  eeprom_update_byte((uint8_t *)0, (uint8_t)c);  // writes only if it differs
+  persistedMode = c;
+}
+// Called from loop(), so the ~3 ms EEPROM write never lands in an interrupt
+// (a mode set over libusb happens in the USB ISR). eeprom_update writes only
+// when the byte differs, so it also stays off the wear budget when idle.
+static void persistMode()
+{
+  if (mode != persistedMode) {
+    eeprom_update_byte((uint8_t *)0, (uint8_t)mode);
+    persistedMode = mode;
+  }
+}
+#endif
 // The captures, one array per field rather than an array of 6-byte structs:
 // indexing those needs a multiply, which the compiler does with a library
 // call, and a call inside an interrupt makes it save every call-clobbered
@@ -441,13 +488,12 @@ static void reportStack()
 static uint8_t burst[BURST_BYTES];
 static uint8_t burstLen;       // bytes in burst[]
 
+// The free-running stream, in either spelling ('s' hex, 'S' binary).
+static bool streaming() { return mode == 's' || mode == 'S'; }
+
 static bool conditioned()
 {
-#if STREAM_MODE
-  if (mode == 'S')
-    return true;
-#endif
-  return mode == 'x' || mode == 'X';
+  return streaming() || mode == 'x' || mode == 'X';
 }
 
 // The raw modes come in two spellings: uppercase binary (R, D) for the
@@ -456,7 +502,7 @@ static bool conditioned()
 static bool rawIntervals() { return mode == 'r' || mode == 'R'; }
 static bool rawAdc()       { return mode == 'd' || mode == 'D'; }
 // Which output is hex text: conditioned 'x', and the two lowercase raw modes.
-static bool outputHex()    { return mode == 'x' || mode == 'r' || mode == 'd'; }
+static bool outputHex()    { return mode == 'x' || mode == 'r' || mode == 'd' || mode == 's'; }
 
 static uint8_t burstCapacity()  // in bytes: whole intervals in r/R
 {
@@ -532,7 +578,7 @@ static void maybeSqueeze()
     return;
   bool credited = credit >= CREDIT_PER_OUTPUT;
 #if STREAM_MODE
-  if (!credited && (mode != 'S' || seedFills < SEED_FILLS))
+  if (!credited && (!streaming() || seedFills < SEED_FILLS))
     return;
 #else
   if (!credited)
@@ -679,7 +725,7 @@ static void sendBurst()
 #endif
   }
 #if STREAM_MODE
-  if (mode == 'S') {
+  if (streaming()) {
     // No flush and no restart: discarding the samples disturbed by sending is
     // what keeps 'X' honest about its entropy, and 'S' does not make that
     // claim. Stopping for it would cost most of the rate the mode exists for.
@@ -710,7 +756,7 @@ extern "C" uchar digiCdcVendorSetup(usbRequest_t *rq)
     uint8_t m = rq->wValue.bytes[0];
     if (m == 'X' || m == 'r' || m == 'd' || m == 'R' || m == 'D'
 #if STREAM_MODE
-        || m == 'S'
+        || m == 'S' || m == 's'
 #endif
        ) {
       mode = m;
@@ -764,6 +810,9 @@ static void serviceLed()
 void setup()
 {
   txBegin();
+#if MODE_EEPROM
+  restoreMode();
+#endif
 #if LED_STATUS
   DDRB |= _BV(LED_PIN);
   PORTB |= _BV(LED_PIN);   // solid on until the sources validate
@@ -799,6 +848,9 @@ void loop()
 
 #if LED_STATUS
   serviceLed();
+#endif
+#if MODE_EEPROM
+  persistMode();
 #endif
 
   static uint8_t ctrlCs;
@@ -843,7 +895,7 @@ void loop()
       enterBootloader();
     if (c == 'x' || c == 'X' || c == 'r' || c == 'd' || c == 'R' || c == 'D'
 #if STREAM_MODE
-        || c == 'S'
+        || c == 'S' || c == 's'
 #endif
        ) {
       mode = c;
@@ -904,7 +956,7 @@ void loop()
       burst[burstLen++] = readAdc();
   } else if (conditioned()) {
 #if STREAM_MODE
-    uint8_t batch = mode == 'S' ? ADC_BATCH_STREAM : ADC_BATCH;
+    uint8_t batch = streaming() ? ADC_BATCH_STREAM : ADC_BATCH;
 #else
     const uint8_t batch = ADC_BATCH;
 #endif
@@ -921,7 +973,7 @@ void loop()
     // samples: the batch is 16 ADC conversions, about 1.6 ms, and pacing the
     // output to that would hold the stream near the entropy rate, which is
     // the one thing this mode exists not to do.
-    if (mode == 'S')
+    if (streaming())
       // At least once, so seeding can progress (seedFills advances only inside
       // maybeSqueeze, on a credited squeeze); then, once seeded, fill the rest
       // of the burst free-running. Booting straight into 'S' relies on this --

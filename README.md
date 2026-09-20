@@ -62,10 +62,11 @@ Pass them through `EXTRA_FLAGS`, as in
 | `RNG_VENDOR` | 0 | 1: vendor control transfers instead of the serial port (see *Transports*) |
 | `RNG_UART` | 0 | 1: a plain UART on PB2 (TX)/PB0 (RX) instead of USB (see *Transports*) |
 | `RNG_UART_BAUD` | 9600 | UART baud; higher wants a real-hardware timing check |
-| `DEFAULT_MODE` | `S` | the power-up mode, to fix a build to one output without a terminal |
+| `DEFAULT_MODE` | `s` | the power-up mode before any has been stored (see *Modes*); fixes a headless build to one output |
 | `LED_STATUS` | 1 | 0: no status LED |
 | `LED_PIN` | `PB1` | the onboard LED; some clones wire it to `PB0` |
-| `STREAM_MODE` | 1 | 0: no `S` mode, 130 bytes less flash |
+| `STREAM_MODE` | 1 | 0: no `s`/`S` streaming mode, 130 bytes less flash |
+| `MODE_EEPROM` | 1 | 1: remember the last mode in EEPROM byte 0 across power cycles; 0: always boot `DEFAULT_MODE` |
 | `RNG_CDC_ECHO` | `RNG_VENDOR` | 1: echo the serial port back, to prove it still works while the bytes go out over libusb |
 | `ADC_BATCH` | 16 | ADC readings between USB services. Tuned; the transmitter's timing was measured with it |
 | `STACK_CHECK` | 0 | 1: report never-used RAM after each `x` line |
@@ -74,10 +75,10 @@ Sizes on the Digispark, of the 6650 bytes micronucleus leaves and 512 of RAM:
 
 | build | flash | RAM |
 |---|---|---|
-| default (USB CDC) | 6176 | 373 |
-| `RNG_VENDOR=1` | 6032 | 378 |
-| `RNG_UART=1` | 3526 | 152 |
-| `LED_STATUS=0` | 6024 | 372 |
+| default (USB CDC) | 6396 | 374 |
+| `RNG_VENDOR=1` | 6234 | 379 |
+| `RNG_UART=1` | 3754 | 153 |
+| `LED_STATUS=0` | 6202 | 373 |
 
 The UART build is half the size because it carries no USB stack at all.
 
@@ -89,17 +90,26 @@ Lowercase is hex text (readable on a terminal); uppercase is binary.
 
 | mode | output |
 |---|---|
-| `S` | conditioned, free-running at ~5700 bytes/s, binary (**the default**) |
+| `s` / `S` | conditioned, free-running at ~5700 bytes/s, hex / binary |
 | `x` / `X` | conditioned bytes, hex / binary |
 | `r` / `R` | raw watchdog intervals, low 16 bits of CPU cycles, hex / binary |
 | `d` / `D` | raw ADC readings, signed bytes, hex / binary |
 
-The default is `S`: on power-up it gathers entropy until seeded, then streams
-binary at the chip's full rate -- meant to feed a program. Send `x` for
-readable hex, or the assessment tools drive the uppercase `R`/`D`.
+The default is `s`: on power-up it gathers entropy until seeded, then streams
+hex at the chip's full rate, so the first thing you see in a serial terminal is
+readable random data. Send `S` for the same stream in binary to feed a program,
+`x`/`X` for entropy-rate output, or the assessment tools drive the uppercase
+`R`/`D`.
 
-`S` is a different thing from `X` and the difference is the whole point of
-this project, so it is worth stating plainly. In `X` every bit is backed by
+The last mode you select is remembered in EEPROM byte 0 and restored on the
+next power-up, so a board keeps whatever you set it to. A blank or unrecognised
+byte (`0xFF` on a fresh chip) falls back to `DEFAULT_MODE`, which is written
+back so the byte is valid from then on. Turn this off with `MODE_EEPROM=0`, and
+the board always boots `DEFAULT_MODE`.
+
+`s`/`S` (the same stream, hex or binary) are a different thing from `x`/`X`,
+and the difference is the whole point of this project, so it is worth stating
+plainly. In `X` every bit is backed by
 credited entropy, and the output is unpredictable even against an adversary
 with unlimited computation. `S` keeps squeezing whether or not entropy has
 been credited for it, so its output is unpredictable *because Ascon is* -- a
@@ -140,10 +150,11 @@ different properties and only the second one matters here.
 ### Read the binary modes with the tty in raw mode
 
 A tty starts cooked, with echo on, and a serial port's echo goes back *to the
-device*. In `X`, `S`, `r` and `d` that means the host echoes random bytes back
-at the sketch, and about one byte in 256 is a mode character -- so the mode
-changes by itself, and a stream turns into a trickle of something else. The
-default `x` is immune, hex digits being no command, which is why this went
+device*. In the binary modes `X`, `S`, `R` and `D` that means the host echoes
+random bytes back at the sketch, and about one byte in 256 is a mode character
+-- so the mode changes by itself, and a stream turns into a trickle of
+something else. The hex modes (`x`, `s`, `r`, `d`) are immune, hex digits being
+no command, and the default `s` is one of them, which is why this went
 unnoticed for so long.
 
     stty -F /dev/ttyACM0 raw -echo
