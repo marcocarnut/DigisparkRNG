@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Tools for clockdrift_rng raw sample dumps ('r' and 'd' modes).
+"""Tools for clockdrift_rng raw sample dumps ('R' and 'D' modes).
 
 usage:
-  rawdump.py symbols capture.bin r|d out.sym
+  rawdump.py symbols capture.bin R|D out.sym
       Write one byte per sample for SP 800-90B ea_non_iid (8 bits/symbol):
-      'd' ADC readings as signed bytes, 'r' low 8 bits of each interval.
+      'D' ADC readings as signed bytes, 'R' low 16 bits of each interval.
   rawdump.py cutoffs H [A]
       SP 800-90B health test cutoffs (alpha = 2^-A, default 40; APT window
       512) for a min-entropy of H bits per sample. The spec allows A from 20
@@ -33,7 +33,7 @@ def bursts(path, kind):
 
 
 def samples(path, kind):
-    if kind == "d":
+    if kind in ("d", "D"):
         return [b for burst in bursts(path, kind) for b in burst]
     return [int.from_bytes(burst[j:j + 2], "big")
             for burst in bursts(path, kind) for j in range(0, len(burst) - 1, 2)]

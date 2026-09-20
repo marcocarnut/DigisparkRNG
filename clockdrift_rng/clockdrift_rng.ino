@@ -27,7 +27,7 @@
   SP 800-90B repetition count and adaptive proportion tests run on every
   sample; a source that fails stops being credited.
 
-  Output is hex, 78 digits per line ('x'), or raw bytes ('X').
+  Output is hex ('x', 78 digits a line) or binary ('X'); 'S' streams.
   USB activity disturbs both sources, so
   all modes collect a burst with no output, send it, then discard the samples
   taken while sending.
@@ -46,14 +46,26 @@
   Sending Ctrl-C three times in a row (within 2 s) reboots into the bootloader.
 
   Transport: the random bytes leave over USB (DigiCDCFast) by default, or over
-  a plain 8N1 UART on PB1 (TX) / PB0 (RX) when built with RNG_UART -- no USB at
+  a plain 8N1 UART on PB2 (TX) / PB0 (RX) when built with RNG_UART -- no USB at
   all, so it runs on any board and under a simulator, and reads on a terminal
   or feeds another microcontroller's UART. See the RNG_UART block below.
 */
 
 // Transport, chosen before the includes because RNG_UART removes V-USB.
 #ifndef RNG_UART
-#define RNG_UART 0     // 1: a bit-banged UART on PB1/PB0 instead of USB
+#define RNG_UART 0     // 1: a bit-banged UART on PB2/PB0 instead of USB
+#endif
+
+// Status LED on PB1 (the onboard LED on most Digisparks; some clones wire it
+// to PB0 -- define LED_PIN then). Solid while it has not yet validated the
+// sources and so emits nothing; a brief 10% blink once a second while
+// generating normally with both sources passing; a fast 50% blink, five times
+// a second, if a source has failed its health tests.
+#ifndef LED_STATUS
+#define LED_STATUS 1
+#endif
+#ifndef LED_PIN
+#define LED_PIN PB1
 #endif
 
 #if RNG_UART
@@ -113,27 +125,32 @@ static volatile bool bootWanted;      // asked for from inside the interrupt
 static uint8_t overruns;              // captures dropped waiting to be read
 #endif
 
-// Output mode, switchable at runtime by sending the character over serial:
-//  'x': conditioned random bytes (hex).
-//  'X': conditioned random bytes (binary, no messages).
-//  'r': raw consecutive intervals in CPU cycles, low 16 bits (binary).
-//  'd': raw consecutive ADC readings as signed bytes (binary).
-//  'R': the intervals as hex, for reading on a terminal (a simulator).
-//  'D': the ADC readings as hex, likewise.
-// Binary bursts ('X','r','d','S') are framed as 0xA5, mode, byte count, data;
-// the assessment tools read 'r'/'d'. The hex modes are for eyes, not tools.
-// The mode at power-up; override it to observe a particular one without a
-// terminal (a simulator, or a fixed-purpose standalone device).
+// Output mode, switchable at runtime by sending the character over serial.
+// Lowercase is hex text (readable on a terminal); uppercase is binary.
+//  'x' / 'X': conditioned random bytes, hex / binary.
+//  'S':       conditioned, free-running at the chip's rate (binary; the
+//             default). Streams for a program, so there is no hex 's'.
+//  'r' / 'R': raw watchdog intervals, low 16 bits of CPU cycles, hex / binary.
+//  'd' / 'D': raw ADC readings, signed bytes, hex / binary.
+// Binary bursts (X, S, R, D) are framed as 0xA5, mode, byte count, data; the
+// assessment tools read the uppercase R and D. Hex is for eyes, not tools.
+// The mode at power-up; override it to fix a build to one output without a
+// terminal (a simulator, or a standalone device).
+#ifndef STREAM_MODE
+#define STREAM_MODE       1    // full definition and rationale below
+#endif
 #ifndef DEFAULT_MODE
 #if RNG_VENDOR
-#define DEFAULT_MODE      'X'  // no hex over libusb: the host formats
+#define DEFAULT_MODE      'X'  // the host formats; libusb reads bursts
+#elif STREAM_MODE
+#define DEFAULT_MODE      'S'  // stream binary at full rate once seeded
 #else
-#define DEFAULT_MODE      'x'  // human-readable on a plain terminal
+#define DEFAULT_MODE      'X'  // binary conditioned, when there is no stream
 #endif
 #endif
 
 // Entropy credit per sample, in 1/64 bit; 0 disables crediting a source.
-// SP 800-90B non-IID assessment (ea_non_iid) on 'r'/'d' dumps:
+// SP 800-90B non-IID assessment (ea_non_iid) on 'R'/'D' dumps:
 //   intervals (low 8 bits):  6.44 bits/sample from 66747 samples
 //   ADC readings (0..11):    1.09 bits/sample from 1232751 samples as 4-bit
 //                            symbols (1.11 as 8-bit; 1.14 from 286299 earlier)
@@ -204,6 +221,7 @@ struct Health {       // SP 800-90B health test state for one source
 };
 
 static char mode = DEFAULT_MODE;
+static bool producing;    // has validated entropy and squeezed at least once
 // The captures, one array per field rather than an array of 6-byte structs:
 // indexing those needs a multiply, which the compiler does with a library
 // call, and a call inside an interrupt makes it save every call-clobbered
@@ -272,7 +290,7 @@ static void enterBootloader()
 #ifndef RNG_UART_BAUD
 #define RNG_UART_BAUD 9600   // 9600 is safe on the internal RC; 115200 works in
 #endif                       // Wokwi (8 MHz) and wants a scope check on hardware
-#define UART_TX  PB1         // also the Digispark LED: it flickers as it sends
+#define UART_TX  PB2         // PB1 is the status LED, so TX is on PB2
 #define UART_RX  PB0
 
 // Each bit is exactly one bit period of CPU cycles. The delay is counted in
@@ -432,13 +450,13 @@ static bool conditioned()
   return mode == 'x' || mode == 'X';
 }
 
-// The raw modes come in two spellings: lowercase binary (r, d) for the
-// assessment tools, uppercase hex (R, D) for reading on a plain terminal.
+// The raw modes come in two spellings: uppercase binary (R, D) for the
+// assessment tools, lowercase hex (r, d) for reading on a plain terminal.
 // Each samples the same source; only the output format differs.
 static bool rawIntervals() { return mode == 'r' || mode == 'R'; }
 static bool rawAdc()       { return mode == 'd' || mode == 'D'; }
-// Which output is hex: conditioned 'x', and the two uppercase raw modes.
-static bool outputHex()    { return mode == 'x' || mode == 'R' || mode == 'D'; }
+// Which output is hex text: conditioned 'x', and the two lowercase raw modes.
+static bool outputHex()    { return mode == 'x' || mode == 'r' || mode == 'd'; }
 
 static uint8_t burstCapacity()  // in bytes: whole intervals in r/R
 {
@@ -520,6 +538,7 @@ static void maybeSqueeze()
   if (!credited)
     return;
 #endif
+  producing = true;   // validated entropy is now coming out (drives the LED)
   state[39] ^= 0x80;  // domain separation from absorbing
   ascon_permute(state, 12);
   for (uint8_t i = 0; i < 8 && burstLen < burstCapacity(); i++)
@@ -624,7 +643,7 @@ static void sendBurst()
 #if STACK_CHECK
     reportStack();
 #endif
-  } else if (mode == 'r' || mode == 'd') {
+  } else if (mode == 'R' || mode == 'D') {
     put(0xA5);
     put(mode);
     put(bytes);
@@ -689,7 +708,7 @@ extern "C" uchar digiCdcVendorSetup(usbRequest_t *rq)
     return vendorLen;
   case RNG_RQ_MODE: {
     uint8_t m = rq->wValue.bytes[0];
-    if (m == 'X' || m == 'r' || m == 'd'
+    if (m == 'X' || m == 'r' || m == 'd' || m == 'R' || m == 'D'
 #if STREAM_MODE
         || m == 'S'
 #endif
@@ -722,9 +741,33 @@ extern "C" uchar digiCdcVendorSetup(usbRequest_t *rq)
 }
 #endif
 
+#if LED_STATUS
+// Solid until the RNG is producing, a brief blink a second once it is, a fast
+// 50% blink if a source failed. Single-bit PORTB writes are one sbi/cbi each,
+// so they cannot race V-USB's own PORTB writes on the USB build.
+static void serviceLed()
+{
+  bool on;
+  if (intervalHealth.failed || adcHealth.failed)
+    on = (millis() % 200) < 100;    // 5 Hz, 50%: a source failed its tests
+  else if (producing)
+    on = (millis() % 1000) < 100;   // 1 Hz, 10%: generating, both healthy
+  else
+    on = true;                      // solid: not yet validated, emitting nothing
+  if (on)
+    PORTB |= _BV(LED_PIN);
+  else
+    PORTB &= ~_BV(LED_PIN);
+}
+#endif
+
 void setup()
 {
   txBegin();
+#if LED_STATUS
+  DDRB |= _BV(LED_PIN);
+  PORTB |= _BV(LED_PIN);   // solid on until the sources validate
+#endif
 
   initAscon();
   if (!asconOk)
@@ -753,6 +796,10 @@ void loop()
   static __uint24 stamp[2];
   static bool haveFineOffset;
   static uint8_t fineOffset;
+
+#if LED_STATUS
+  serviceLed();
+#endif
 
   static uint8_t ctrlCs;
   static unsigned long firstCtrlC;
@@ -875,8 +922,13 @@ void loop()
     // output to that would hold the stream near the entropy rate, which is
     // the one thing this mode exists not to do.
     if (mode == 'S')
-      while (seedFills >= SEED_FILLS && burstLen < burstCapacity())
+      // At least once, so seeding can progress (seedFills advances only inside
+      // maybeSqueeze, on a credited squeeze); then, once seeded, fill the rest
+      // of the burst free-running. Booting straight into 'S' relies on this --
+      // gating the whole thing on seedFills would never seed from cold.
+      do
         maybeSqueeze();
+      while (seedFills >= SEED_FILLS && burstLen < burstCapacity());
     else
 #endif
       maybeSqueeze();

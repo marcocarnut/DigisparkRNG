@@ -60,9 +60,11 @@ Pass them through `EXTRA_FLAGS`, as in
 | option | | |
 |---|---|---|
 | `RNG_VENDOR` | 0 | 1: vendor control transfers instead of the serial port (see *Transports*) |
-| `RNG_UART` | 0 | 1: a plain UART on PB1/PB0 instead of USB (see *Transports*) |
+| `RNG_UART` | 0 | 1: a plain UART on PB2 (TX)/PB0 (RX) instead of USB (see *Transports*) |
 | `RNG_UART_BAUD` | 9600 | UART baud; higher wants a real-hardware timing check |
-| `DEFAULT_MODE` | `x`/`X` | the power-up mode, to fix a build to one output without a terminal |
+| `DEFAULT_MODE` | `S` | the power-up mode, to fix a build to one output without a terminal |
+| `LED_STATUS` | 1 | 0: no status LED |
+| `LED_PIN` | `PB1` | the onboard LED; some clones wire it to `PB0` |
 | `STREAM_MODE` | 1 | 0: no `S` mode, 130 bytes less flash |
 | `RNG_CDC_ECHO` | `RNG_VENDOR` | 1: echo the serial port back, to prove it still works while the bytes go out over libusb |
 | `ADC_BATCH` | 16 | ADC readings between USB services. Tuned; the transmitter's timing was measured with it |
@@ -72,10 +74,10 @@ Sizes on the Digispark, of the 6650 bytes micronucleus leaves and 512 of RAM:
 
 | build | flash | RAM |
 |---|---|---|
-| default (USB CDC) | 6014 | 372 |
-| `STREAM_MODE=0` | 5884 | 371 |
-| `RNG_VENDOR=1` | 5880 | 377 |
-| `RNG_UART=1` | 3390 | 151 |
+| default (USB CDC) | 6176 | 373 |
+| `RNG_VENDOR=1` | 6032 | 378 |
+| `RNG_UART=1` | 3526 | 152 |
+| `LED_STATUS=0` | 6024 | 372 |
 
 The UART build is half the size because it carries no USB stack at all.
 
@@ -83,15 +85,18 @@ The UART build is half the size because it carries no USB stack at all.
 
 Send the character over the serial port, or ask for it with `rngread --mode`:
 
+Lowercase is hex text (readable on a terminal); uppercase is binary.
+
 | mode | output |
 |---|---|
-| `x` | conditioned bytes as hex, 78 digits a line (default) |
-| `X` | conditioned bytes, binary, no messages |
-| `S` | the same conditioner free-running, 5650 bytes/s |
-| `r` | raw watchdog intervals, low 16 bits of CPU cycles, binary |
-| `d` | raw ADC readings, signed bytes, binary |
-| `R` | the intervals as hex, for reading on a terminal |
-| `D` | the ADC readings as hex |
+| `S` | conditioned, free-running at ~5700 bytes/s, binary (**the default**) |
+| `x` / `X` | conditioned bytes, hex / binary |
+| `r` / `R` | raw watchdog intervals, low 16 bits of CPU cycles, hex / binary |
+| `d` / `D` | raw ADC readings, signed bytes, hex / binary |
+
+The default is `S`: on power-up it gathers entropy until seeded, then streams
+binary at the chip's full rate -- meant to feed a program. Send `x` for
+readable hex, or the assessment tools drive the uppercase `R`/`D`.
 
 `S` is a different thing from `X` and the difference is the whole point of
 this project, so it is worth stating plainly. In `X` every bit is backed by
@@ -147,6 +152,24 @@ unnoticed for so long.
 that sets raw mode itself. A `cat` or a plain `open()` is not. (Found by the
 rngtacho session, on a device that had quietly switched itself to `r`.)
 
+## Status LED
+
+An LED on PB1 (the onboard one on most Digisparks) reports what the RNG is
+doing, so a standalone device with no serial monitor still tells you it is
+alive and honest:
+
+| LED | meaning |
+|---|---|
+| solid on | starting up -- sources not yet validated, no output yet |
+| brief blink, once a second | generating normally, both sources passing |
+| fast blink, 5 times a second | a source has failed its health tests |
+
+The fast blink takes precedence: it means at least one source is dead even if
+the other is still producing output. Single-bit writes drive the pin, so it
+cannot disturb V-USB on the USB build. `LED_STATUS=0` removes it; `LED_PIN`
+moves it (some clones wire the LED to PB0). It is why the UART's TX is on PB2
+rather than PB1.
+
 ## Transports
 
 Three ways the bytes leave the chip, chosen at build time:
@@ -175,7 +198,7 @@ Three ways the bytes leave the chip, chosen at build time:
   whether each source still passes its health tests, bursts dropped because
   nobody read them, and whether `S` mode has been seeded.
 
-**A plain UART**, with `RNG_UART=1`: 8N1 on PB1 (TX) and PB0 (RX), no USB. It
+**A plain UART**, with `RNG_UART=1`: 8N1 on PB2 (TX) and PB0 (RX), no USB. It
 reads on any terminal through a USB-serial cable, or feeds another
 microcontroller's UART directly -- the RNG as a serial entropy peripheral, with
 no host that has to speak CDC. Modes switch and Ctrl-C reaches the bootloader

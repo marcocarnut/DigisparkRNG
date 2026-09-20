@@ -1,9 +1,9 @@
 #!/bin/sh
-# usage: assess.sh [ADC_MINUTES] [INTERVAL_MINUTES]  -- capture raw ADC ('d')
-# and interval ('r') samples for the given minutes (defaults 6 and 45; 0
+# usage: assess.sh [ADC_MINUTES] [INTERVAL_MINUTES]  -- capture raw ADC ('D')
+# and interval ('R') samples for the given minutes (defaults 6 and 45; 0
 # skips a source), run the SP 800-90B non-IID assessment on each and print
 # health test cutoffs. Everything is kept in captures/<date-time>/. Leaves
-# the board in 'x' mode.
+# the board in 'x' mode (hex conditioned).
 # Rates: ~3500 ADC samples/s (1M in ~5 min), ~50 intervals/s (1M in ~6 h).
 # Long runs: use nohup and check summary.txt afterwards.
 set -e
@@ -27,6 +27,6 @@ run() {  # kind minutes name
   } | tee -a "$DIR/summary.txt"
 }
 
-run d "$ADC_MINUTES" ADC
-run r "$INTERVAL_MINUTES" intervals
+run D "$ADC_MINUTES" ADC
+run R "$INTERVAL_MINUTES" intervals
 echo "results in $DIR"
