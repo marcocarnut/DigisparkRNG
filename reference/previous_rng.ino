@@ -27,7 +27,7 @@
   SP 800-90B repetition count and adaptive proportion tests run on every
   sample; a source that fails stops being credited.
 
-  Output is hex ('x', 78 digits a line) or binary ('X'); 'S' streams.
+  Output is hex, 78 digits per line ('x'), or raw bytes ('X').
   USB activity disturbs both sources, so
   all modes collect a burst with no output, send it, then discard the samples
   taken while sending.
@@ -46,26 +46,14 @@
   Sending Ctrl-C three times in a row (within 2 s) reboots into the bootloader.
 
   Transport: the random bytes leave over USB (DigiCDCFast) by default, or over
-  a plain 8N1 UART on PB2 (TX) / PB0 (RX) when built with RNG_UART -- no USB at
+  a plain 8N1 UART on PB1 (TX) / PB0 (RX) when built with RNG_UART -- no USB at
   all, so it runs on any board and under a simulator, and reads on a terminal
   or feeds another microcontroller's UART. See the RNG_UART block below.
 */
 
 // Transport, chosen before the includes because RNG_UART removes V-USB.
 #ifndef RNG_UART
-#define RNG_UART 0     // 1: a bit-banged UART on PB2/PB0 instead of USB
-#endif
-
-// Status LED on PB1 (the onboard LED on most Digisparks; some clones wire it
-// to PB0 -- define LED_PIN then). Solid while it has not yet validated the
-// sources and so emits nothing; a brief 10% blink once a second while
-// generating normally with both sources passing; a fast 50% blink, five times
-// a second, if a source has failed its health tests.
-#ifndef LED_STATUS
-#define LED_STATUS 1
-#endif
-#ifndef LED_PIN
-#define LED_PIN PB1
+#define RNG_UART 1     // 1: a bit-banged UART on PB1/PB0 instead of USB
 #endif
 
 #if RNG_UART
@@ -74,14 +62,6 @@
 #include <DigiCDCFast.h>
 #endif
 #include <avr/wdt.h>
-#include <avr/eeprom.h>
-
-// Remember the last mode across power cycles in EEPROM byte 0, so a device
-// keeps whatever it was set to. Erased EEPROM (0xFF) means "never set" and
-// becomes the default. 0 disables it: the mode is always DEFAULT_MODE.
-#ifndef MODE_EEPROM
-#define MODE_EEPROM 1
-#endif
 
 // Transport for the random bytes.
 //   0: a line (or a binary burst) on the USB serial port, read with any
@@ -133,33 +113,27 @@ static volatile bool bootWanted;      // asked for from inside the interrupt
 static uint8_t overruns;              // captures dropped waiting to be read
 #endif
 
-// Output mode, switchable at runtime by sending the character over serial.
-// Lowercase is hex text (readable on a terminal); uppercase is binary.
-//  'x' / 'X': conditioned random bytes, hex / binary.
-//  's' / 'S': conditioned, free-running at the chip's rate, hex / binary.
-//             's' is the default -- readable hex a terminal shows on plug-in.
-//  'r' / 'R': raw watchdog intervals, low 16 bits of CPU cycles, hex / binary.
-//  'd' / 'D': raw ADC readings, signed bytes, hex / binary.
-// Binary bursts (X, S, R, D) are framed as 0xA5, mode, byte count, data; the
-// assessment tools read the uppercase R and D. Hex is for eyes, not tools.
-// The mode is remembered in EEPROM across power cycles (see MODE_EEPROM).
-// The mode at power-up; override it to fix a build to one output without a
-// terminal (a simulator, or a standalone device).
-#ifndef STREAM_MODE
-#define STREAM_MODE       1    // full definition and rationale below
-#endif
+// Output mode, switchable at runtime by sending the character over serial:
+//  'x': conditioned random bytes (hex).
+//  'X': conditioned random bytes (binary, no messages).
+//  'r': raw consecutive intervals in CPU cycles, low 16 bits (binary).
+//  'd': raw consecutive ADC readings as signed bytes (binary).
+//  'R': the intervals as hex, for reading on a terminal (a simulator).
+//  'D': the ADC readings as hex, likewise.
+// Binary bursts ('X','r','d','S') are framed as 0xA5, mode, byte count, data;
+// the assessment tools read 'r'/'d'. The hex modes are for eyes, not tools.
+// The mode at power-up; override it to observe a particular one without a
+// terminal (a simulator, or a fixed-purpose standalone device).
 #ifndef DEFAULT_MODE
 #if RNG_VENDOR
-#define DEFAULT_MODE      'X'  // the host formats; libusb reads bursts
-#elif STREAM_MODE
-#define DEFAULT_MODE      's'  // hex stream: what a terminal shows first
+#define DEFAULT_MODE      'X'  // no hex over libusb: the host formats
 #else
-#define DEFAULT_MODE      'x'  // hex conditioned, when there is no stream
+#define DEFAULT_MODE      'x'  // human-readable on a plain terminal
 #endif
 #endif
 
 // Entropy credit per sample, in 1/64 bit; 0 disables crediting a source.
-// SP 800-90B non-IID assessment (ea_non_iid) on 'R'/'D' dumps:
+// SP 800-90B non-IID assessment (ea_non_iid) on 'r'/'d' dumps:
 //   intervals (low 8 bits):  6.44 bits/sample from 66747 samples
 //   ADC readings (0..11):    1.09 bits/sample from 1232751 samples as 4-bit
 //                            symbols (1.11 as 8-bit; 1.14 from 286299 earlier)
@@ -230,45 +204,6 @@ struct Health {       // SP 800-90B health test state for one source
 };
 
 static char mode = DEFAULT_MODE;
-static bool producing;    // has validated entropy and squeezed at least once
-
-// A legal mode letter (STREAM_MODE gates 's'/'S'). Used to reject a corrupt or
-// erased EEPROM byte on boot.
-static bool validMode(char c)
-{
-  if (c == 'x' || c == 'X' || c == 'r' || c == 'R' || c == 'd' || c == 'D')
-    return true;
-#if STREAM_MODE
-  if (c == 's' || c == 'S')
-    return true;
-#endif
-  return false;
-}
-
-#if MODE_EEPROM
-static char persistedMode;   // last value known to be in EEPROM byte 0
-// Boot: adopt the stored mode; an erased (0xFF) or corrupt byte becomes the
-// default and is written back. loop() then writes any later change once.
-static void restoreMode()
-{
-  char c = (char)eeprom_read_byte((const uint8_t *)0);
-  if (!validMode(c))
-    c = DEFAULT_MODE;
-  mode = c;
-  eeprom_update_byte((uint8_t *)0, (uint8_t)c);  // writes only if it differs
-  persistedMode = c;
-}
-// Called from loop(), so the ~3 ms EEPROM write never lands in an interrupt
-// (a mode set over libusb happens in the USB ISR). eeprom_update writes only
-// when the byte differs, so it also stays off the wear budget when idle.
-static void persistMode()
-{
-  if (mode != persistedMode) {
-    eeprom_update_byte((uint8_t *)0, (uint8_t)mode);
-    persistedMode = mode;
-  }
-}
-#endif
 // The captures, one array per field rather than an array of 6-byte structs:
 // indexing those needs a multiply, which the compiler does with a library
 // call, and a call inside an interrupt makes it save every call-clobbered
@@ -278,20 +213,6 @@ static uint8_t  ringT1[RING_SIZE];   // TCNT1 (ticks every 64 CPU cycles)
 static uint8_t  ringT0[RING_SIZE];   // TCNT0 (ticks every CPU cycle)
 static volatile uint8_t ringHead, ringTail;
 static volatile bool overrun;
-
-#if LED_STATUS
-// The LED's clock: the watchdog fires ~62.5 times a second (16 ms period) and
-// is the one timebase that runs everywhere. millis() is not: setup() reprograms
-// Timer0 for the entropy timestamp and clears its overflow interrupt, so a core
-// that runs millis() on Timer0 (the ATtiny cores Wokwi uses) never advances it.
-// The Digispark core runs millis() on Timer1, so it survives on real hardware
-// -- but the watchdog tick blinks the LED identically in both.
-static volatile uint16_t ledTicks;
-#define LED_WDT_HZ     62                  // watchdog interrupts per second
-#define LED_SLOW       LED_WDT_HZ          // ~1 s period, the "producing" blink
-#define LED_SLOW_ON    (LED_WDT_HZ / 10)   // ~10% duty
-#define LED_FAST       (LED_WDT_HZ / 5)    // ~5 Hz period, the "failed" blink
-#endif
 
 ISR(WDT_vect)
 {
@@ -317,9 +238,6 @@ ISR(WDT_vect)
     ringT0[h] = t0;
     ringHead = next;
   }
-#if LED_STATUS
-  ledTicks++;   // last, so it never delays the timestamp reads above
-#endif
 }
 
 // Runs before init(): a watchdog reset leaves the watchdog armed, and
@@ -352,9 +270,9 @@ static void enterBootloader()
 #if RNG_UART
 
 #ifndef RNG_UART_BAUD
-#define RNG_UART_BAUD 9600   // 9600 is safe on the internal RC; 115200 works in
+#define RNG_UART_BAUD 115200   // 9600 is safe on the internal RC; 115200 works in
 #endif                       // Wokwi (8 MHz) and wants a scope check on hardware
-#define UART_TX  PB2         // PB1 is the status LED, so TX is on PB2
+#define UART_TX  PB1         // also the Digispark LED: it flickers as it sends
 #define UART_RX  PB0
 
 // Each bit is exactly one bit period of CPU cycles. The delay is counted in
@@ -440,25 +358,8 @@ static void txFlush() {}  // txByte returns only once the byte is on the wire
 
 #else  // USB transport
 
-static bool streaming();       // defined below; needed by txByte
-static bool txDropped;         // a stream write hit a stalled reader this burst
-
 static void txBegin()          { SerialUSB.begin(); }
-// A stalled reader must never wedge the free-running stream. If it did, loop()
-// would stop being re-entered -- the LED would freeze and the three Ctrl-Cs
-// into the bootloader would never be read. So in a streaming mode we drop the
-// rest of the burst on the first short write, exactly as the binary 'S' path
-// does (one burst of random bytes is as good as another); 'x' and the raw
-// modes still block, so their credited or finite output is never lost.
-static void txByte(uint8_t c)
-{
-  if (streaming()) {
-    if (!txDropped && !SerialUSB.write(c))
-      txDropped = true;
-  } else {
-    while (!SerialUSB.write(c));
-  }
-}
+static void txByte(uint8_t c)  { while (!SerialUSB.write(c)); }
 static void txFlush()          { SerialUSB.flush(); }
 static bool rxAvail()          { return SerialUSB.available(); }
 static uint8_t rxRead()        { return SerialUSB.read(); }
@@ -522,21 +423,22 @@ static void reportStack()
 static uint8_t burst[BURST_BYTES];
 static uint8_t burstLen;       // bytes in burst[]
 
-// The free-running stream, in either spelling ('s' hex, 'S' binary).
-static bool streaming() { return mode == 's' || mode == 'S'; }
-
 static bool conditioned()
 {
-  return streaming() || mode == 'x' || mode == 'X';
+#if STREAM_MODE
+  if (mode == 'S')
+    return true;
+#endif
+  return mode == 'x' || mode == 'X';
 }
 
-// The raw modes come in two spellings: uppercase binary (R, D) for the
-// assessment tools, lowercase hex (r, d) for reading on a plain terminal.
+// The raw modes come in two spellings: lowercase binary (r, d) for the
+// assessment tools, uppercase hex (R, D) for reading on a plain terminal.
 // Each samples the same source; only the output format differs.
 static bool rawIntervals() { return mode == 'r' || mode == 'R'; }
 static bool rawAdc()       { return mode == 'd' || mode == 'D'; }
-// Which output is hex text: conditioned 'x', and the two lowercase raw modes.
-static bool outputHex()    { return mode == 'x' || mode == 'r' || mode == 'd' || mode == 's'; }
+// Which output is hex: conditioned 'x', and the two uppercase raw modes.
+static bool outputHex()    { return mode == 'x' || mode == 'R' || mode == 'D'; }
 
 static uint8_t burstCapacity()  // in bytes: whole intervals in r/R
 {
@@ -612,13 +514,12 @@ static void maybeSqueeze()
     return;
   bool credited = credit >= CREDIT_PER_OUTPUT;
 #if STREAM_MODE
-  if (!credited && (!streaming() || seedFills < SEED_FILLS))
+  if (!credited && (mode != 'S' || seedFills < SEED_FILLS))
     return;
 #else
   if (!credited)
     return;
 #endif
-  producing = true;   // validated entropy is now coming out (drives the LED)
   state[39] ^= 0x80;  // domain separation from absorbing
   ascon_permute(state, 12);
   for (uint8_t i = 0; i < 8 && burstLen < burstCapacity(); i++)
@@ -711,9 +612,6 @@ static void sendBurst()
   // hundreds of milliseconds against the transfer's few.)
   vendorLen = bytes;
 #else
-#if !RNG_UART
-  txDropped = false;   // fresh drop budget for this burst (CDC stream only)
-#endif
   if (outputHex()) {
     // 'x' (conditioned) and the raw hex modes 'R'/'D' all print two hex digits
     // a byte and end the line -- readable on any terminal.
@@ -726,7 +624,7 @@ static void sendBurst()
 #if STACK_CHECK
     reportStack();
 #endif
-  } else if (mode == 'R' || mode == 'D') {
+  } else if (mode == 'r' || mode == 'd') {
     put(0xA5);
     put(mode);
     put(bytes);
@@ -762,7 +660,7 @@ static void sendBurst()
 #endif
   }
 #if STREAM_MODE
-  if (streaming()) {
+  if (mode == 'S') {
     // No flush and no restart: discarding the samples disturbed by sending is
     // what keeps 'X' honest about its entropy, and 'S' does not make that
     // claim. Stopping for it would cost most of the rate the mode exists for.
@@ -791,9 +689,9 @@ extern "C" uchar digiCdcVendorSetup(usbRequest_t *rq)
     return vendorLen;
   case RNG_RQ_MODE: {
     uint8_t m = rq->wValue.bytes[0];
-    if (m == 'X' || m == 'r' || m == 'd' || m == 'R' || m == 'D'
+    if (m == 'X' || m == 'r' || m == 'd'
 #if STREAM_MODE
-        || m == 'S' || m == 's'
+        || m == 'S'
 #endif
        ) {
       mode = m;
@@ -824,42 +722,9 @@ extern "C" uchar digiCdcVendorSetup(usbRequest_t *rq)
 }
 #endif
 
-#if LED_STATUS
-// Solid until the RNG is producing, a brief blink a second once it is, a fast
-// 50% blink if a source failed. Single-bit PORTB writes are one sbi/cbi each,
-// so they cannot race V-USB's own PORTB writes on the USB build.
-static void serviceLed()
-{
-  uint16_t t;
-  uint8_t s = SREG;
-  cli();
-  t = ledTicks;   // 16-bit read the WDT ISR could otherwise tear
-  SREG = s;
-
-  bool on;
-  if (intervalHealth.failed || adcHealth.failed)
-    on = (t % LED_FAST) < (LED_FAST / 2);   // ~5 Hz, 50%: a source failed
-  else if (producing)
-    on = (t % LED_SLOW) < LED_SLOW_ON;      // ~1 Hz, 10%: generating, healthy
-  else
-    on = true;                              // solid: not validated, no output
-  if (on)
-    PORTB |= _BV(LED_PIN);
-  else
-    PORTB &= ~_BV(LED_PIN);
-}
-#endif
-
 void setup()
 {
   txBegin();
-#if MODE_EEPROM
-  restoreMode();
-#endif
-#if LED_STATUS
-  DDRB |= _BV(LED_PIN);
-  PORTB |= _BV(LED_PIN);   // solid on until the sources validate
-#endif
 
   initAscon();
   if (!asconOk)
@@ -888,13 +753,6 @@ void loop()
   static __uint24 stamp[2];
   static bool haveFineOffset;
   static uint8_t fineOffset;
-
-#if LED_STATUS
-  serviceLed();
-#endif
-#if MODE_EEPROM
-  persistMode();
-#endif
 
   static uint8_t ctrlCs;
   static unsigned long firstCtrlC;
@@ -938,7 +796,7 @@ void loop()
       enterBootloader();
     if (c == 'x' || c == 'X' || c == 'r' || c == 'd' || c == 'R' || c == 'D'
 #if STREAM_MODE
-        || c == 'S' || c == 's'
+        || c == 'S'
 #endif
        ) {
       mode = c;
@@ -999,7 +857,7 @@ void loop()
       burst[burstLen++] = readAdc();
   } else if (conditioned()) {
 #if STREAM_MODE
-    uint8_t batch = streaming() ? ADC_BATCH_STREAM : ADC_BATCH;
+    uint8_t batch = mode == 'S' ? ADC_BATCH_STREAM : ADC_BATCH;
 #else
     const uint8_t batch = ADC_BATCH;
 #endif
@@ -1016,14 +874,9 @@ void loop()
     // samples: the batch is 16 ADC conversions, about 1.6 ms, and pacing the
     // output to that would hold the stream near the entropy rate, which is
     // the one thing this mode exists not to do.
-    if (streaming())
-      // At least once, so seeding can progress (seedFills advances only inside
-      // maybeSqueeze, on a credited squeeze); then, once seeded, fill the rest
-      // of the burst free-running. Booting straight into 'S' relies on this --
-      // gating the whole thing on seedFills would never seed from cold.
-      do
+    if (mode == 'S')
+      while (seedFills >= SEED_FILLS && burstLen < burstCapacity())
         maybeSqueeze();
-      while (seedFills >= SEED_FILLS && burstLen < burstCapacity());
     else
 #endif
       maybeSqueeze();
