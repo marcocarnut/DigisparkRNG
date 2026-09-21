@@ -17,6 +17,11 @@ suite ever written passes -- so the statistical run tests the *plumbing*. The
 claim about the entropy rests on the SP 800-90B assessment of the raw samples
 below.
 
+**Try it in the browser:** the UART build runs in the Wokwi simulator at
+<https://wokwi.com/projects/475707136206905345> -- the `s` stream and the status
+LED, no hardware needed. See [`wokwi/`](wokwi/) for how it is wired and what the
+simulator can and cannot do.
+
 ## Layout
 
 - `clockdrift_rng/`: the sketch. `~/Arduino/clockdrift_rng` is a symlink to
@@ -33,6 +38,8 @@ below.
   - `assess.sh [ADC_MINUTES] [INTERVAL_MINUTES]`: raw `d` and `r` captures, the
     SP 800-90B assessment and health test cutoffs, all in `captures/<date-time>/`
   - `build-sp800-90b.sh`: rebuild `ea_non_iid` and its libraries in `third_party/`
+- `wokwi/`: the Wokwi simulator diagram and notes for running the UART build in
+  a browser (see the link above)
 
 Not in the repository, because they belong to other projects: `arduino-cli`
 (copied from the Arduino IDE AppImage), `arduino-lint`, `ea_non_iid` (built by
@@ -61,24 +68,24 @@ Pass them through `EXTRA_FLAGS`, as in
 |---|---|---|
 | `RNG_VENDOR` | 0 | 1: vendor control transfers instead of the serial port (see *Transports*) |
 | `RNG_UART` | 0 | 1: a plain UART on PB2 (TX)/PB0 (RX) instead of USB (see *Transports*) |
-| `RNG_UART_BAUD` | 9600 | UART baud; higher wants a real-hardware timing check |
+| `RNG_UART_BAUD` | 115200 | UART baud; the send blocks per byte, so lower rates block longer (see *Transports*) |
 | `DEFAULT_MODE` | `s` | the power-up mode before any has been stored (see *Modes*); fixes a headless build to one output |
 | `LED_STATUS` | 1 | 0: no status LED |
 | `LED_PIN` | `PB1` | the onboard LED; some clones wire it to `PB0` |
-| `STREAM_MODE` | 1 | 0: no `s`/`S` streaming mode, 130 bytes less flash |
+| `STREAM_MODE` | 1 | 0: no `s`/`S` streaming mode, 140 bytes less flash |
 | `MODE_EEPROM` | 1 | 1: remember the last mode in EEPROM byte 0 across power cycles; 0: always boot `DEFAULT_MODE` |
 | `RNG_CDC_ECHO` | `RNG_VENDOR` | 1: echo the serial port back, to prove it still works while the bytes go out over libusb |
-| `ADC_BATCH` | 16 | ADC readings between USB services. Tuned; the transmitter's timing was measured with it |
+| `ADC_BATCH` | 16 | ADC readings per loop pass. Tuned; the transmitter's timing was measured with it |
 | `STACK_CHECK` | 0 | 1: report never-used RAM after each `x` line |
 
 Sizes on the Digispark, of the 6650 bytes micronucleus leaves and 512 of RAM:
 
 | build | flash | RAM |
 |---|---|---|
-| default (USB CDC) | 6396 | 374 |
-| `RNG_VENDOR=1` | 6234 | 379 |
-| `RNG_UART=1` | 3754 | 153 |
-| `LED_STATUS=0` | 6202 | 373 |
+| default (USB CDC) | 6376 | 377 |
+| `RNG_VENDOR=1` | 6206 | 381 |
+| `RNG_UART=1` | 3712 | 157 |
+| `LED_STATUS=0` | 6242 | 374 |
 
 The UART build is half the size because it carries no USB stack at all.
 
@@ -129,7 +136,7 @@ perfect-looking bytes from a stale seed, forever and silently.** In `X` the
 rate visibly collapses. So a consumer of `S` should check the source flags and
 `seeded` (`rngread --info`) rather than trusting the stream on its own.
 Compile it out with `STREAM_MODE=0` if you would rather it not exist; it costs
-130 bytes of flash.
+140 bytes of flash.
 
 Measured: **5650 bytes/s**, twenty times `X`'s 284, against a theoretical
 8000 that low-speed USB allows with 8-byte packets. The permutation is not
@@ -212,24 +219,31 @@ Three ways the bytes leave the chip, chosen at build time:
 **A plain UART**, with `RNG_UART=1`: 8N1 on PB2 (TX) and PB0 (RX), no USB. It
 reads on any terminal through a USB-serial cable, or feeds another
 microcontroller's UART directly -- the RNG as a serial entropy peripheral, with
-no host that has to speak CDC. Modes switch and Ctrl-C reaches the bootloader
-over RX exactly as over USB. Two things to know:
+no host that has to speak CDC. The receiver is the ATtiny85's USI, so a byte
+costs two short interrupts rather than a busy-wait, and Ctrl-C over RX reaches
+the bootloader. Three things to know:
 
 - **Timing.** The 16.5 MHz clock is held precise, in the USB builds, by tuning
   against the USB frame; a UART build has no such reference and rides the
-  internal RC oscillator's error, which drifts with temperature. 9600 (the
-  default) tolerates that comfortably; higher `RNG_UART_BAUD` wants checking on
-  real hardware.
+  internal RC oscillator, set once at boot and then drifting with temperature.
+  The default is 115200 (so a send blocks for only ~87 us -- see below); it
+  works here at room temperature but sits nearer the oscillator's margin than a
+  slower rate, so drop `RNG_UART_BAUD` (9600, ...) if a board runs hot or cold.
 - **Half duplex.** A byte is transmitted with interrupts off so the watchdog
   cannot stretch it into a framing error, which means the port is deaf while a
-  burst goes out. Typed commands land in the gaps between bursts -- fine for
-  `x`/`X`, but leaving `S` (which streams almost continuously) may take a reset.
-  And each received byte is a ~1 ms interrupts-off window that can perturb one
-  interval sample: rare, and only while you are typing, but it is literally the
-  act of talking to the RNG nudging the jitter it measures.
+  burst goes out. Typed commands land in the gaps between bursts -- fine for the
+  slower modes, but switching out of `s`/`S` (which stream almost continuously)
+  may take a few tries. A received byte briefly borrows Timer0, the
+  fine-timestamp clock, to run the USI: it disturbs at most the one interval
+  that spans the keystroke, and the next sample is clean -- the act of talking
+  to the RNG nudging the jitter it measures, but only while you type.
+- **Simulator.** The USI receiver is clocked by a Timer0 compare match, which
+  Wokwi's avr8js does not implement, so reception -- and mode switching over the
+  UART -- does not work in the simulator, though the transmit stream and the LED
+  do. See [`wokwi/`](wokwi/). On real hardware the receiver works.
 
 The USB transports both measure the same 285 bytes/s; the UART's throughput is
-set by its baud (960 bytes/s at 9600), well above the entropy rate.
+set by its baud (11.5 kB/s at 115200), well above the entropy rate.
 
 ## Assessing the entropy
 

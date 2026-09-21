@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "author": "DigisparkRNG",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-attiny85", "id": "attiny", "top": 18, "left": 15.2, "attrs": { "clockFrequency": "8000000" } },
+    { "type": "wokwi-led", "id": "led1", "top": -109.2, "left": 23.4, "attrs": { "color": "red", "flip": "1" } },
+    { "type": "wokwi-resistor", "id": "r1", "top": -24, "left": 9.05, "rotate": 90, "attrs": { "value": "1000" } }
+  ],
+  "connections": [
+    [ "attiny:GND", "$serialMonitor:GND", "black", [] ],
+    [ "$serialMonitor:TX", "attiny:PB0", "blue", [] ],
+    [ "$serialMonitor:RX", "attiny:PB2", "yellow", [] ],
+    [ "led1:A", "r1:1", "green", [ "v19.2" ] ],
+    [ "led1:C", "attiny:GND", "green", [ "v0", "h18.8", "v115.2" ] ],
+    [ "attiny:PB1", "r1:2", "green", [ "v-8.4", "h-0.8" ] ]
+  ],
+  "serialMonitor": { "display": "always", "newline": "lf" },
+  "dependencies": {}
+}

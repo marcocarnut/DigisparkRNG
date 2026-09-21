@@ -27,10 +27,12 @@
   SP 800-90B repetition count and adaptive proportion tests run on every
   sample; a source that fails stops being credited.
 
-  Output is hex ('x', 78 digits a line) or binary ('X'); 'S' streams.
-  USB activity disturbs both sources, so
-  all modes collect a burst with no output, send it, then discard the samples
-  taken while sending.
+  Output: lowercase is hex text, uppercase binary. 's'/'S' stream conditioned
+  bytes at the chip's rate ('s', hex, is the default); 'x'/'X' emit them at the
+  entropy rate; 'r'/'R' and 'd'/'D' dump the raw sources (a table is at the mode
+  block below). Sending disturbs both sources, so the entropy-rate and raw modes
+  collect a burst with no output, send it, then discard the samples taken
+  meanwhile; the streaming modes accept that and keep going.
 
   Timestamping details
   --------------------
@@ -195,12 +197,9 @@ static uint8_t overruns;              // captures dropped waiting to be read
 // stale seed if a source dies -- which is exactly the failure that becomes
 // invisible here and is visible in 'X'. The host can see it: ask for the
 // source flags.
-#ifndef STREAM_MODE
-#define STREAM_MODE       1
-#endif
 #define SEED_FILLS        4   // x 128 credited bits into a 256-bit capacity
 #ifndef ADC_BATCH
-#define ADC_BATCH         16          // readings between USB services
+#define ADC_BATCH         16          // ADC readings per loop pass (between sends)
 #endif
 // 'S' services USB far more often: a conversion is about 100 us and the host
 // takes 8 bytes a frame, so sampling in sixteens leaves the pipe idle half
