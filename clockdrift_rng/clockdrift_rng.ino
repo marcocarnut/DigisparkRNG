@@ -357,107 +357,113 @@ static void enterBootloader()
 #define UART_TX  PB2         // PB1 is the status LED, so TX is on PB2
 #define UART_RX  PB0
 
-// Transmit bit timing: each bit is one bit period of CPU cycles, with the
-// send loop's own overhead subtracted, so it holds at 115200 on an 8 MHz part
-// (~69 cycles a bit, mostly overhead) as well as at 9600 (~1700, where it is
-// noise). F_CPU/baud adapts to whatever clock the build uses. UART_TX_OVERHEAD
-// is the non-delay cycles of one send-loop pass, from the disassembly; tune it
-// if a receiver sees framing errors. Receive samples on a timer interrupt, not
-// with delays (below).
 #define UART_BIT_CYCLES (F_CPU / RNG_UART_BAUD)
-#ifndef UART_TX_OVERHEAD
-#define UART_TX_OVERHEAD 10
+// Receive is a busy-wait read (below), timed with cycle-counted delays. These
+// overheads are the non-delay cycles of one sample-loop pass, from the
+// disassembly; tune them if a sender sees framing errors. Receives are rare
+// (a mode keystroke now and then), so the read blocking briefly is harmless.
+#ifndef UART_RX_OVERHEAD
+#define UART_RX_OVERHEAD 9
+#endif
+#ifndef UART_RX_START_OVERHEAD
+#define UART_RX_START_OVERHEAD 25  // interrupt latency + prologue + the start test
 #endif
 
 // Received bytes wait here for loop() -- a keystroke or two, never a stream.
 static volatile uint8_t uartRx[4];
 static volatile uint8_t uartRxHead, uartRxTail;
-static uint8_t rxBitTicks;   // Timer0 CTC period - 1 for one bit, set in txBegin
-static uint8_t rxPrescaler;  // Timer0 clock-select bits for the bit rate
-static uint8_t rxBitIdx;     // 0 = start bit, 1..8 = data bits; ISR-only
-static uint8_t rxAcc;        // the byte building up, LSB first; ISR-only
 
-// A whole byte is bit-banged with interrupts off, so it cannot be stretched by
-// the watchdog interrupt into a framing error. The samples the watchdog would
-// have taken meanwhile are discarded after the send anyway (see sendBurst).
+// The transmitter runs from a Timer0 compare interrupt, one bit at a time, so
+// it never holds interrupts off. The old delay-loop send did, for a whole
+// character -- long enough that an incoming start bit was missed while a burst
+// streamed, which is why mode switches did not take mid-stream. Timer0 stays
+// free-running for the entropy fine-timestamp; the interrupt paces bits by
+// rescheduling OCR0A relative to the free-running count (OCR0A += txSubtick).
+// A software divisor (txDiv sub-ticks per bit) keeps each step under 256 counts
+// so low bit rates work without ever leaving free-running mode.
+static volatile uint16_t txFrame;    // remaining frame bits, LSB = next to send
+static volatile uint8_t  txBitsLeft; // frame bits left (10 = start+8+stop); 0 = idle
+static volatile uint8_t  txDivCount; // sub-ticks until the next bit
+static uint8_t txSubtick;            // Timer0 ticks between sub-ticks (< 256)
+static uint8_t txDiv;                // sub-ticks per bit; both set in txBegin
+
+// Hand a byte to the transmit interrupt. It blocks only while the previous
+// byte is still going out -- and that wait runs with interrupts on, so the
+// receive start-bit interrupt and the watchdog still fire. The frame is start
+// bit (0), eight data bits LSB first, stop bit (1); the interrupt clocks it out
+// and stops itself. The brief cli() only guards the handoff, not the send.
 static void txByte(uint8_t c)
 {
+  while (txBitsLeft)                     // previous byte in flight; let ISRs run
+    ;
+  uint16_t frame = ((uint16_t)c << 1) | 0x200;
   uint8_t s = SREG;
   cli();
-  uint16_t frame = ((uint16_t)c << 1) | 0x200;  // start bit (0), 8 data, stop (1)
-  for (uint8_t i = 0; i < 10; i++) {
-    // Branchless, so every bit takes the same cycles whatever its value -- a
-    // data-dependent branch would jitter the bit width, which shows at 115200.
-    PORTB = (PORTB & ~_BV(UART_TX)) | ((uint8_t)(frame & 1) << UART_TX);
-    frame >>= 1;
-    __builtin_avr_delay_cycles(UART_BIT_CYCLES - UART_TX_OVERHEAD);
-  }
-  SREG = s;                          // line left idle high on the stop bit
+  txFrame = frame;
+  txDivCount = txDiv;
+  txBitsLeft = 10;
+  OCR0A = TCNT0 + txSubtick;             // first sub-tick from the current count
+  TIFR = _BV(OCF0A);                     // drop any stale compare flag
+  TIMSK |= _BV(OCIE0A);                  // start clocking bits out
+  SREG = s;
 }
 
-// Receive one bit per Timer0 compare interrupt, so the handler stays a few
-// instructions and interrupts stay on -- a bit-banged read would hold them off
-// for a whole character (~1 ms at 9600), stalling the entropy timing and, on
-// the USB build, USB itself. PCINT0 on PB0 catches the start bit's falling edge
-// (INT0 can't: its pin is PB2, the TX line); Timer0 in CTC then interrupts once
-// per bit, sampling PB0 at each bit's middle, and PCINT0 re-arms when the byte
-// is in. (The USI could shift the byte in hardware with no per-bit interrupt,
-// but avr8js -- Wokwi's engine -- does not clock the USI from Timer0, so
-// sampling the pin directly runs the same in the simulator and on the chip.)
-//
-// Timer0 is the entropy fine-timestamp between bytes; reception borrows it (CTC
-// at the bit rate) and hands it back free-running when the byte is done. The
-// timestamp is used as a difference, so Timer0's phase shift cancels out -- only
-// the one interval spanning the keystroke is disturbed, then it is clean again.
-ISR(PCINT0_vect)                    // start bit
+// One bit of the outgoing byte, on each Timer0 compare match. Timer0 free-runs
+// (entropy timestamp), so OCR0A is stepped forward by hand each time; txDivCount
+// divides those steps down to the bit rate, quick-returning between bits.
+ISR(TIMER0_COMPA_vect)
+{
+  OCR0A += txSubtick;                    // schedule the next sub-tick
+  if (--txDivCount)                      // not a bit boundary yet
+    return;
+  txDivCount = txDiv;
+  if (txFrame & 1)                       // put the next frame bit on the wire
+    PORTB |= _BV(UART_TX);
+  else
+    PORTB &= ~_BV(UART_TX);
+  txFrame >>= 1;
+  if (--txBitsLeft == 0)                 // stop bit (1) sent: line idles high
+    TIMSK &= ~_BV(OCIE0A);
+}
+
+// A start bit's falling edge on PB0 lands here. The whole byte is read inline
+// with a cycle-counted busy-wait -- receives are rare (a mode command), so the
+// ~1 ms it holds interrupts off is harmless; at worst it stretches one bit of
+// an outgoing byte, one glitched byte in the stream. INT0 can't do the start
+// detection (its pin is PB2, the TX line), so it is on the pin-change interrupt.
+ISR(PCINT0_vect)
 {
   if (PINB & _BV(UART_RX))          // a rising edge, or noise: not a start bit
     return;
-  PCMSK = 0;                        // one byte at a time: no PCINT during the read
-  rxBitIdx = 0;
-  rxAcc = 0;
-  TCCR0B = 0;
-  TCCR0A = _BV(WGM01);              // CTC: Timer0 clears at OCR0A, one tick a bit
-  OCR0A = rxBitTicks;
-  TCNT0 = rxBitTicks / 2;           // first interrupt lands mid start bit
-  TIFR = _BV(OCF0A);
-  TIMSK |= _BV(OCIE0A);             // sample a bit on each compare match
-  TCCR0B = rxPrescaler;
-}
-
-ISR(TIMER0_COMPA_vect)              // one bit, sampled mid-bit
-{
-  if (rxBitIdx++ == 0)              // the first match is the start bit: skip it
-    return;
-  // LSB first: shift right, new bit into the top. After eight, bit 0 is the LSB.
-  rxAcc = (rxAcc >> 1) | (((PINB >> UART_RX) & 1) << 7);
-  if (rxBitIdx > 8) {               // the eighth data bit is in
-    TCCR0A = 0;                     // hand Timer0 back to the entropy timestamp:
-    TCCR0B = _BV(CS00);             // normal mode, free-running at F_CPU
-    TIMSK &= ~_BV(OCIE0A);          // stop the per-bit interrupt
-    uint8_t next = (uartRxHead + 1) & 3;
-    if (next != uartRxTail) {       // drop it rather than overwrite an unread one
-      uartRx[uartRxHead] = rxAcc;
-      uartRxHead = next;
-    }
-    GIFR = _BV(PCIF);               // ignore any edge seen during the read
-    PCMSK = _BV(UART_RX);           // re-arm the start-bit detector
+  __builtin_avr_delay_cycles(UART_BIT_CYCLES + UART_BIT_CYCLES / 2 - UART_RX_START_OVERHEAD);
+  uint8_t b = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    // Shift the new bit in at the top -- constant time, where `b |= 1 << i`
+    // would take longer for higher bits and jitter the sampling at 115200.
+    b = (b >> 1) | (((PINB >> UART_RX) & 1) << 7);  // 8N1, least significant first
+    __builtin_avr_delay_cycles(UART_BIT_CYCLES - UART_RX_OVERHEAD);
   }
+  uint8_t next = (uartRxHead + 1) & 3;
+  if (next != uartRxTail) {         // drop it rather than overwrite an unread one
+    uartRx[uartRxHead] = b;
+    uartRxHead = next;
+  }
+  GIFR = _BV(PCIF);                 // edges during the read set this; clear it
 }
 
 static void txBegin()
 {
-  // One bit in Timer0 ticks, at clk/8 or clk/64 if that overflows the 8-bit
-  // counter. Constant-folded: RNG_UART_BAUD and F_CPU are known at compile time.
-  unsigned long ticks = (F_CPU / 8 + RNG_UART_BAUD / 2) / RNG_UART_BAUD;
-  rxPrescaler = _BV(CS01);                 // clk/8
-  if (ticks > 256) {
-    ticks = (F_CPU / 64 + RNG_UART_BAUD / 2) / RNG_UART_BAUD;
-    rxPrescaler = _BV(CS01) | _BV(CS00);   // clk/64
-  }
-  rxBitTicks = ticks - 1;
+  // Split one bit period into txDiv sub-ticks of txSubtick counts each, with
+  // txSubtick < 256 so OCR0A can be stepped on the free-running (prescaler-1)
+  // Timer0. Constant-folded: RNG_UART_BAUD and F_CPU are known at compile time.
+  uint16_t bitTicks = UART_BIT_CYCLES;
+  uint8_t div = (bitTicks + 254) / 255;    // fewest sub-ticks that fit 8 bits
+  if (div == 0)
+    div = 1;
+  txDiv = div;
+  txSubtick = (bitTicks + div / 2) / div;  // rounded, so the baud stays accurate
 
-  PORTB |= _BV(UART_TX) | _BV(UART_RX);  // TX idle high; RX (USI DI) pull-up
+  PORTB |= _BV(UART_TX) | _BV(UART_RX);  // TX idle high; RX pull-up
   DDRB |= _BV(UART_TX);                   // TX output, RX stays input
   PCMSK = _BV(UART_RX);                   // pin-change only on RX (the start bit)
   GIFR = _BV(PCIF);
