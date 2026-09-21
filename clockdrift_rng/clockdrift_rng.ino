@@ -339,8 +339,7 @@ static void enterBootloader()
   cli();
   WDTCR = _BV(WDCE) | _BV(WDE);
   WDTCR = 0;
-  USICR = 0;      // stop the USI receiver (no-op on the USB build)
-  TIMSK = 0;
+  TIMSK = 0;      // also stops the per-bit receive interrupt (UART build)
   TCCR0B = 0;
   TCCR1 = 0;
   ((void (*)())0)();
@@ -363,7 +362,8 @@ static void enterBootloader()
 // (~69 cycles a bit, mostly overhead) as well as at 9600 (~1700, where it is
 // noise). F_CPU/baud adapts to whatever clock the build uses. UART_TX_OVERHEAD
 // is the non-delay cycles of one send-loop pass, from the disassembly; tune it
-// if a receiver sees framing errors. Receive uses the USI, not delays (below).
+// if a receiver sees framing errors. Receive samples on a timer interrupt, not
+// with delays (below).
 #define UART_BIT_CYCLES (F_CPU / RNG_UART_BAUD)
 #ifndef UART_TX_OVERHEAD
 #define UART_TX_OVERHEAD 10
@@ -374,6 +374,8 @@ static volatile uint8_t uartRx[4];
 static volatile uint8_t uartRxHead, uartRxTail;
 static uint8_t rxBitTicks;   // Timer0 CTC period - 1 for one bit, set in txBegin
 static uint8_t rxPrescaler;  // Timer0 clock-select bits for the bit rate
+static uint8_t rxBitIdx;     // 0 = start bit, 1..8 = data bits; ISR-only
+static uint8_t rxAcc;        // the byte building up, LSB first; ISR-only
 
 // A whole byte is bit-banged with interrupts off, so it cannot be stretched by
 // the watchdog interrupt into a framing error. The samples the watchdog would
@@ -393,45 +395,54 @@ static void txByte(uint8_t c)
   SREG = s;                          // line left idle high on the stop bit
 }
 
-// Receive with the USI, so the ISRs stay short and interrupts stay on -- a
-// bit-banged read would hold them off for a whole character (~1 ms at 9600),
-// stalling the entropy timing and, on the USB build, USB itself. PCINT0 on PB0
-// catches the start bit's falling edge (INT0 can't: its pin is PB2, the TX
-// line), then the USI shifts the eight data bits in, clocked by Timer0 at the
-// bit rate, and PCINT0 re-arms once they are in. USI wire mode 0 samples DI
-// (PB0) only -- it never drives DO (PB1, the LED) or USCK (PB2, TX).
+// Receive one bit per Timer0 compare interrupt, so the handler stays a few
+// instructions and interrupts stay on -- a bit-banged read would hold them off
+// for a whole character (~1 ms at 9600), stalling the entropy timing and, on
+// the USB build, USB itself. PCINT0 on PB0 catches the start bit's falling edge
+// (INT0 can't: its pin is PB2, the TX line); Timer0 in CTC then interrupts once
+// per bit, sampling PB0 at each bit's middle, and PCINT0 re-arms when the byte
+// is in. (The USI could shift the byte in hardware with no per-bit interrupt,
+// but avr8js -- Wokwi's engine -- does not clock the USI from Timer0, so
+// sampling the pin directly runs the same in the simulator and on the chip.)
 //
-// Timer0 is the entropy fine-timestamp between bytes; the start bit borrows it
-// (CTC at the bit rate) and USI_OVF hands it back free-running. The timestamp
-// is a difference, so Timer0's phase shift cancels out -- only the one interval
-// spanning the keystroke is disturbed, and the next one is clean again.
-ISR(PCINT0_vect)
+// Timer0 is the entropy fine-timestamp between bytes; reception borrows it (CTC
+// at the bit rate) and hands it back free-running when the byte is done. The
+// timestamp is used as a difference, so Timer0's phase shift cancels out -- only
+// the one interval spanning the keystroke is disturbed, then it is clean again.
+ISR(PCINT0_vect)                    // start bit
 {
   if (PINB & _BV(UART_RX))          // a rising edge, or noise: not a start bit
     return;
   PCMSK = 0;                        // one byte at a time: no PCINT during the read
+  rxBitIdx = 0;
+  rxAcc = 0;
   TCCR0B = 0;
   TCCR0A = _BV(WGM01);              // CTC: Timer0 clears at OCR0A, one tick a bit
   OCR0A = rxBitTicks;
-  TCNT0 = rxBitTicks / 2;           // first USI sample lands mid start bit
+  TCNT0 = rxBitTicks / 2;           // first interrupt lands mid start bit
   TIFR = _BV(OCF0A);
-  USISR = _BV(USIOIF) | 7;          // overflow after 9 shifts: start + 8 data bits
-  USICR = _BV(USIOIE) | _BV(USICS0);  // mode 0 (DI only), clocked by Timer0 match
+  TIMSK |= _BV(OCIE0A);             // sample a bit on each compare match
   TCCR0B = rxPrescaler;
 }
 
-ISR(USI_OVF_vect)                   // the eight data bits are in
+ISR(TIMER0_COMPA_vect)              // one bit, sampled mid-bit
 {
-  USICR = 0;                        // stop the USI
-  TCCR0A = 0;                        // hand Timer0 back to the entropy timestamp:
-  TCCR0B = _BV(CS00);                // normal mode, free-running at F_CPU
-  uint8_t next = (uartRxHead + 1) & 3;
-  if (next != uartRxTail) {         // drop it rather than overwrite an unread one
-    uartRx[uartRxHead] = USIBR;     // bits arrived LSB-first; rxRead un-reverses
-    uartRxHead = next;
+  if (rxBitIdx++ == 0)              // the first match is the start bit: skip it
+    return;
+  // LSB first: shift right, new bit into the top. After eight, bit 0 is the LSB.
+  rxAcc = (rxAcc >> 1) | (((PINB >> UART_RX) & 1) << 7);
+  if (rxBitIdx > 8) {               // the eighth data bit is in
+    TCCR0A = 0;                     // hand Timer0 back to the entropy timestamp:
+    TCCR0B = _BV(CS00);             // normal mode, free-running at F_CPU
+    TIMSK &= ~_BV(OCIE0A);          // stop the per-bit interrupt
+    uint8_t next = (uartRxHead + 1) & 3;
+    if (next != uartRxTail) {       // drop it rather than overwrite an unread one
+      uartRx[uartRxHead] = rxAcc;
+      uartRxHead = next;
+    }
+    GIFR = _BV(PCIF);               // ignore any edge seen during the read
+    PCMSK = _BV(UART_RX);           // re-arm the start-bit detector
   }
-  GIFR = _BV(PCIF);                 // ignore any edge seen during the read
-  PCMSK = _BV(UART_RX);             // re-arm the start-bit detector
 }
 
 static void txBegin()
@@ -456,11 +467,8 @@ static void txBegin()
 static bool rxAvail() { return uartRxHead != uartRxTail; }
 static uint8_t rxRead()
 {
-  uint8_t s = uartRx[uartRxTail];
+  uint8_t c = uartRx[uartRxTail];   // the ISR already assembled it LSB-first
   uartRxTail = (uartRxTail + 1) & 3;
-  uint8_t c = 0;                 // the USI shifted DI in LSB-first: bit 0 is bit 7
-  for (uint8_t i = 0; i < 8; i++, s >>= 1)
-    c = (c << 1) | (s & 1);
   return c;
 }
 static void txFlush() {}  // txByte returns only once the byte is on the wire
