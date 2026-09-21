@@ -339,6 +339,7 @@ static void enterBootloader()
   cli();
   WDTCR = _BV(WDCE) | _BV(WDE);
   WDTCR = 0;
+  USICR = 0;      // stop the USI receiver (no-op on the USB build)
   TIMSK = 0;
   TCCR0B = 0;
   TCCR1 = 0;
@@ -359,24 +360,20 @@ static void enterBootloader()
 #define UART_TX  PB2         // PB1 is the status LED, so TX is on PB2
 #define UART_RX  PB0
 
-// Both directions bit-bang with cycle-counted delays. Each bit is one bit
-// period of CPU cycles minus the non-delay cycles of one loop pass (the
-// overheads, read from the disassembly); F_CPU/baud adapts to the build clock.
-// Tune the overheads if a receiver or sender sees framing errors.
+// The transmitter bit-bangs with cycle-counted delays; UART_TX_OVERHEAD is the
+// non-delay cycles of one send-loop pass (from the disassembly), and F_CPU/baud
+// adapts to the build clock. Tune UART_TX_OVERHEAD if a receiver sees framing
+// errors. The receiver instead uses the USI, clocked by Timer0 (below).
 #define UART_BIT_CYCLES (F_CPU / RNG_UART_BAUD)
 #ifndef UART_TX_OVERHEAD
 #define UART_TX_OVERHEAD 10
-#endif
-#ifndef UART_RX_OVERHEAD
-#define UART_RX_OVERHEAD 9
-#endif
-#ifndef UART_RX_START_OVERHEAD
-#define UART_RX_START_OVERHEAD 25  // interrupt latency + prologue + the start test
 #endif
 
 // Received bytes wait here for loop() -- a keystroke or two, never a stream.
 static volatile uint8_t uartRx[4];
 static volatile uint8_t uartRxHead, uartRxTail;
+static uint8_t rxBitTicks;   // Timer0 CTC period - 1 for one bit, set in txBegin
+static uint8_t rxPrescaler;  // Timer0 clock-select bits for the bit rate
 
 // A whole byte is bit-banged with interrupts off, so the watchdog can't stretch
 // a bit into a framing error. It blocks the caller for the byte -- ~87 us at
@@ -399,34 +396,64 @@ static void txByte(uint8_t c)
   SREG = s;                          // line left idle high on the stop bit
 }
 
-// A start bit's falling edge on PB0 lands here. The whole byte is read inline
-// with a cycle-counted busy-wait -- receives are rare (a mode command), so the
-// ~1 ms it holds interrupts off is harmless; at worst it stretches one bit of
-// an outgoing byte, one glitched byte in the stream. INT0 can't do the start
-// detection (its pin is PB2, the TX line), so it is on the pin-change interrupt.
+// Receive with the USI, so the ISRs stay short and interrupts stay on -- a
+// bit-banged read would hold them off for a whole character. PCINT0 on PB0
+// catches the start bit's falling edge (INT0 can't: its pin is PB2, the TX
+// line), then the USI shifts the eight data bits in, clocked by Timer0 at the
+// bit rate, and PCINT0 re-arms once they are in. USI wire mode 0 samples DI
+// (PB0) only -- it never drives DO (PB1, the LED) or USCK (PB2, TX).
+//
+// Timer0 is the entropy fine-timestamp between bytes; the start bit borrows it
+// (CTC at the bit rate) and USI_OVF hands it back free-running. The timestamp
+// is a difference, so Timer0's phase shift cancels out -- only the one interval
+// spanning the keystroke is disturbed, and the next one is clean again.
+//
+// NOTE: avr8js (Wokwi) does not clock the USI from a Timer0 compare match, so
+// reception -- and switching mode over the UART -- does not work in the
+// emulator. The transmit stream does; to try another mode there, set
+// DEFAULT_MODE at build time. On real hardware the USI receiver works.
 ISR(PCINT0_vect)
 {
   if (PINB & _BV(UART_RX))          // a rising edge, or noise: not a start bit
     return;
-  __builtin_avr_delay_cycles(UART_BIT_CYCLES + UART_BIT_CYCLES / 2 - UART_RX_START_OVERHEAD);
-  uint8_t b = 0;
-  for (uint8_t i = 0; i < 8; i++) {
-    // Shift the new bit in at the top -- constant time, where `b |= 1 << i`
-    // would take longer for higher bits and jitter the sampling at 115200.
-    b = (b >> 1) | (((PINB >> UART_RX) & 1) << 7);  // 8N1, least significant first
-    __builtin_avr_delay_cycles(UART_BIT_CYCLES - UART_RX_OVERHEAD);
-  }
+  PCMSK = 0;                        // one byte at a time: no PCINT during the read
+  TCCR0B = 0;
+  TCCR0A = _BV(WGM01);              // CTC: Timer0 clears at OCR0A, one tick a bit
+  OCR0A = rxBitTicks;
+  TCNT0 = rxBitTicks / 2;           // first USI sample lands mid start bit
+  TIFR = _BV(OCF0A);
+  USISR = _BV(USIOIF) | 7;          // overflow after 9 shifts: start + 8 data bits
+  USICR = _BV(USIOIE) | _BV(USICS0);  // mode 0 (DI only), clocked by Timer0 match
+  TCCR0B = rxPrescaler;
+}
+
+ISR(USI_OVF_vect)                   // the eight data bits are in
+{
+  USICR = 0;                        // stop the USI
+  TCCR0A = 0;                        // hand Timer0 back to the entropy timestamp:
+  TCCR0B = _BV(CS00);                // normal mode, free-running at F_CPU
   uint8_t next = (uartRxHead + 1) & 3;
   if (next != uartRxTail) {         // drop it rather than overwrite an unread one
-    uartRx[uartRxHead] = b;
+    uartRx[uartRxHead] = USIBR;     // bits arrived LSB-first; rxRead un-reverses
     uartRxHead = next;
   }
-  GIFR = _BV(PCIF);                 // edges during the read set this; clear it
+  GIFR = _BV(PCIF);                 // ignore any edge seen during the read
+  PCMSK = _BV(UART_RX);             // re-arm the start-bit detector
 }
 
 static void txBegin()
 {
-  PORTB |= _BV(UART_TX) | _BV(UART_RX);  // TX idle high; RX pull-up
+  // One RX bit in Timer0 ticks, at clk/8 or clk/64 if that overflows the 8-bit
+  // counter. Constant-folded: RNG_UART_BAUD and F_CPU are known at compile time.
+  unsigned long ticks = (F_CPU / 8 + RNG_UART_BAUD / 2) / RNG_UART_BAUD;
+  rxPrescaler = _BV(CS01);                 // clk/8
+  if (ticks > 256) {
+    ticks = (F_CPU / 64 + RNG_UART_BAUD / 2) / RNG_UART_BAUD;
+    rxPrescaler = _BV(CS01) | _BV(CS00);   // clk/64
+  }
+  rxBitTicks = ticks - 1;
+
+  PORTB |= _BV(UART_TX) | _BV(UART_RX);  // TX idle high; RX (USI DI) pull-up
   DDRB |= _BV(UART_TX);                   // TX output, RX stays input
   PCMSK = _BV(UART_RX);                   // pin-change only on RX (the start bit)
   GIFR = _BV(PCIF);
@@ -436,8 +463,11 @@ static void txBegin()
 static bool rxAvail() { return uartRxHead != uartRxTail; }
 static uint8_t rxRead()
 {
-  uint8_t c = uartRx[uartRxTail];   // the ISR already assembled it LSB-first
+  uint8_t s = uartRx[uartRxTail];
   uartRxTail = (uartRxTail + 1) & 3;
+  uint8_t c = 0;                 // the USI shifted DI in LSB-first: bit 0 is bit 7
+  for (uint8_t i = 0; i < 8; i++, s >>= 1)
+    c = (c << 1) | (s & 1);
   return c;
 }
 static void txFlush() {}  // txByte returns only once the byte is on the wire
