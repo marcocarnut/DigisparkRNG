@@ -63,19 +63,16 @@ Board: micronucleus 2.6 bootloader (6650 bytes free). If no sketch is running,
 
 ### Feed the kernel's entropy pool
 
-`tools/rng2random.c` reads conditioned output and adds it to `/dev/random`
-*with an entropy credit* -- the credit is a separate ioctl (`RNDADDENTROPY`)
-that a plain copy (`dd .. of=/dev/random`) does not do, so a copy stirs the pool
-but the kernel counts none of it. Needs root, and wants a **conditioned** mode
-(`x` or `X`), where every bit is backed by credited entropy -- not `s`/`S` (a
-DRBG stream) or the raw modes. It detects hex vs binary from the data's shape.
+Pipe the RNG into `/dev/random` so the CRNG mixes in real hardware entropy. On a
+current kernel a plain copy once a minute -- board left in a conditioned mode
+(`x`/`X`), no root needed -- is more than enough:
 
-    cc -O2 -o tools/rng2random tools/rng2random.c
-    sudo tools/rng2random /dev/ttyACM0 32        # add 32 credited bytes (256 bits)
+    * * * * *  bash -c 'dd if=/dev/ttyACM0 bs=1 count=32 of=/dev/random 2>/dev/null'
 
-From cron, e.g. hourly, with the board left in `x` or `X`:
-
-    0 * * * *  root  /path/to/rng2random /dev/ttyACM0 64 >/dev/null 2>&1
+`tools/rng2random.c` does the same but also *credits* the entropy
+(`RNDADDENTROPY`), which older kernels needed and current ones ignore. See
+[`tools/README.md`](tools/README.md) for when that credit still matters and how
+to use it.
 
 ## Build options
 

@@ -6,6 +6,10 @@
    the pool but credits nothing -- the credit is a separate ioctl. Meant to be
    run from cron. Needs CAP_SYS_ADMIN, so run it as root.
 
+   On a modern kernel (Linux 5.18+) the credit is moot -- the CRNG is always
+   seeded and never blocks -- so a plain 'dd .. of=/dev/random' is enough; this
+   tool is for older kernels and a few niche cases. See tools/README.md.
+
    Usage:  rng2random <device> <nbytes> [credit_bits]
      device       the RNG serial port, e.g. /dev/ttyACM0 (or a USB-serial
                   adapter on the UART build; set its baud with stty first)
