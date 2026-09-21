@@ -34,6 +34,8 @@ simulator can and cannot do.
   - `flash.sh [HEX]`: Ctrl-C x3 into the bootloader, flash, wait for the port
   - `stump.py`: capture a mode, jump to the bootloader, reboot, wait for the port
   - `rngread.c`: read the random bytes over libusb (see *Two transports*)
+  - `rng2random.c`: add conditioned output to `/dev/random` with an entropy
+    credit (`RNDADDENTROPY`); autodetects hex/binary; for cron (see *Typical use*)
   - `60-digispark-rng.rules`: udev rule so `rngread` needs no root
   - `assess.sh [ADC_MINUTES] [INTERVAL_MINUTES]`: raw `d` and `r` captures, the
     SP 800-90B assessment and health test cutoffs, all in `captures/<date-time>/`
@@ -58,6 +60,22 @@ Digistump AVR core provides the board.
 
 Board: micronucleus 2.6 bootloader (6650 bytes free). If no sketch is running,
 `flash.sh` waits 60 s for the board to be plugged in.
+
+### Feed the kernel's entropy pool
+
+`tools/rng2random.c` reads conditioned output and adds it to `/dev/random`
+*with an entropy credit* -- the credit is a separate ioctl (`RNDADDENTROPY`)
+that a plain copy (`dd .. of=/dev/random`) does not do, so a copy stirs the pool
+but the kernel counts none of it. Needs root, and wants a **conditioned** mode
+(`x` or `X`), where every bit is backed by credited entropy -- not `s`/`S` (a
+DRBG stream) or the raw modes. It detects hex vs binary from the data's shape.
+
+    cc -O2 -o tools/rng2random tools/rng2random.c
+    sudo tools/rng2random /dev/ttyACM0 32        # add 32 credited bytes (256 bits)
+
+From cron, e.g. hourly, with the board left in `x` or `X`:
+
+    0 * * * *  root  /path/to/rng2random /dev/ttyACM0 64 >/dev/null 2>&1
 
 ## Build options
 

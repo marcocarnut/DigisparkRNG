@@ -142,8 +142,9 @@ static uint8_t overruns;              // captures dropped waiting to be read
 //             's' is the default -- readable hex a terminal shows on plug-in.
 //  'r' / 'R': raw watchdog intervals, low 16 bits of CPU cycles, hex / binary.
 //  'd' / 'D': raw ADC readings, signed bytes, hex / binary.
-// Binary bursts (X, S, R, D) are framed as 0xA5, mode, byte count, data; the
-// assessment tools read the uppercase R and D. Hex is for eyes, not tools.
+// The raw binary modes 'R'/'D' are framed as 0xA5, mode, byte count, data, so
+// the assessment tools can find the boundaries; the conditioned 'X'/'S' are a
+// plain byte stream. Hex is for eyes, not tools.
 // The mode is remembered in EEPROM across power cycles (see MODE_EEPROM).
 // The mode at power-up; override it to fix a build to one output without a
 // terminal (a simulator, or a standalone device).

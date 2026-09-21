@@ -8,6 +8,7 @@ tools/arduino-cli
 tools/arduino-lint
 tools/ea_non_iid
 tools/rngread
+tools/rng2random
 third_party/
 
 # Assessment runs: megabytes of raw samples, reproducible with tools/assess.sh
