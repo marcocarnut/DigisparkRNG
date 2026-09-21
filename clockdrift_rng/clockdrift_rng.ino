@@ -339,7 +339,7 @@ static void enterBootloader()
   cli();
   WDTCR = _BV(WDCE) | _BV(WDE);
   WDTCR = 0;
-  TIMSK = 0;      // also stops the per-bit receive interrupt (UART build)
+  TIMSK = 0;
   TCCR0B = 0;
   TCCR1 = 0;
   ((void (*)())0)();
@@ -352,16 +352,21 @@ static void enterBootloader()
 #if RNG_UART
 
 #ifndef RNG_UART_BAUD
-#define RNG_UART_BAUD 9600   // 9600 is safe on the internal RC; 115200 works in
-#endif                       // Wokwi (8 MHz) and wants a scope check on hardware
+#define RNG_UART_BAUD 115200 // the send blocks a whole byte (below), so keep it
+#endif                       // short: 115200 is ~87 us; V-USB has OSCCAL pinned
+                             // to 16.5 MHz, so the internal RC holds it. Lower
+                             // rates work too (9600, ...) but block proportionally longer.
 #define UART_TX  PB2         // PB1 is the status LED, so TX is on PB2
 #define UART_RX  PB0
 
+// Both directions bit-bang with cycle-counted delays. Each bit is one bit
+// period of CPU cycles minus the non-delay cycles of one loop pass (the
+// overheads, read from the disassembly); F_CPU/baud adapts to the build clock.
+// Tune the overheads if a receiver or sender sees framing errors.
 #define UART_BIT_CYCLES (F_CPU / RNG_UART_BAUD)
-// Receive is a busy-wait read (below), timed with cycle-counted delays. These
-// overheads are the non-delay cycles of one sample-loop pass, from the
-// disassembly; tune them if a sender sees framing errors. Receives are rare
-// (a mode keystroke now and then), so the read blocking briefly is harmless.
+#ifndef UART_TX_OVERHEAD
+#define UART_TX_OVERHEAD 10
+#endif
 #ifndef UART_RX_OVERHEAD
 #define UART_RX_OVERHEAD 9
 #endif
@@ -373,57 +378,25 @@ static void enterBootloader()
 static volatile uint8_t uartRx[4];
 static volatile uint8_t uartRxHead, uartRxTail;
 
-// The transmitter runs from a Timer0 compare interrupt, one bit at a time, so
-// it never holds interrupts off. The old delay-loop send did, for a whole
-// character -- long enough that an incoming start bit was missed while a burst
-// streamed, which is why mode switches did not take mid-stream. Timer0 stays
-// free-running for the entropy fine-timestamp; the interrupt paces bits by
-// rescheduling OCR0A relative to the free-running count (OCR0A += txSubtick).
-// A software divisor (txDiv sub-ticks per bit) keeps each step under 256 counts
-// so low bit rates work without ever leaving free-running mode.
-static volatile uint16_t txFrame;    // remaining frame bits, LSB = next to send
-static volatile uint8_t  txBitsLeft; // frame bits left (10 = start+8+stop); 0 = idle
-static volatile uint8_t  txDivCount; // sub-ticks until the next bit
-static uint8_t txSubtick;            // Timer0 ticks between sub-ticks (< 256)
-static uint8_t txDiv;                // sub-ticks per bit; both set in txBegin
-
-// Hand a byte to the transmit interrupt. It blocks only while the previous
-// byte is still going out -- and that wait runs with interrupts on, so the
-// receive start-bit interrupt and the watchdog still fire. The frame is start
-// bit (0), eight data bits LSB first, stop bit (1); the interrupt clocks it out
-// and stops itself. The brief cli() only guards the handoff, not the send.
+// A whole byte is bit-banged with interrupts off, so the watchdog can't stretch
+// a bit into a framing error. It blocks the caller for the byte -- ~87 us at
+// 115200, more at lower rates -- which is why an incoming start bit can be
+// missed while a burst streams: mode switching over the UART is reliable only
+// between bursts, or set DEFAULT_MODE at build time. The samples the watchdog
+// would have taken meanwhile are discarded after the send (see sendBurst).
 static void txByte(uint8_t c)
 {
-  while (txBitsLeft)                     // previous byte in flight; let ISRs run
-    ;
-  uint16_t frame = ((uint16_t)c << 1) | 0x200;
   uint8_t s = SREG;
   cli();
-  txFrame = frame;
-  txDivCount = txDiv;
-  txBitsLeft = 10;
-  OCR0A = TCNT0 + txSubtick;             // first sub-tick from the current count
-  TIFR = _BV(OCF0A);                     // drop any stale compare flag
-  TIMSK |= _BV(OCIE0A);                  // start clocking bits out
-  SREG = s;
-}
-
-// One bit of the outgoing byte, on each Timer0 compare match. Timer0 free-runs
-// (entropy timestamp), so OCR0A is stepped forward by hand each time; txDivCount
-// divides those steps down to the bit rate, quick-returning between bits.
-ISR(TIMER0_COMPA_vect)
-{
-  OCR0A += txSubtick;                    // schedule the next sub-tick
-  if (--txDivCount)                      // not a bit boundary yet
-    return;
-  txDivCount = txDiv;
-  if (txFrame & 1)                       // put the next frame bit on the wire
-    PORTB |= _BV(UART_TX);
-  else
-    PORTB &= ~_BV(UART_TX);
-  txFrame >>= 1;
-  if (--txBitsLeft == 0)                 // stop bit (1) sent: line idles high
-    TIMSK &= ~_BV(OCIE0A);
+  uint16_t frame = ((uint16_t)c << 1) | 0x200;  // start bit (0), 8 data, stop (1)
+  for (uint8_t i = 0; i < 10; i++) {
+    // Branchless, so every bit takes the same cycles whatever its value -- a
+    // data-dependent branch would jitter the bit width, which shows at 115200.
+    PORTB = (PORTB & ~_BV(UART_TX)) | ((uint8_t)(frame & 1) << UART_TX);
+    frame >>= 1;
+    __builtin_avr_delay_cycles(UART_BIT_CYCLES - UART_TX_OVERHEAD);
+  }
+  SREG = s;                          // line left idle high on the stop bit
 }
 
 // A start bit's falling edge on PB0 lands here. The whole byte is read inline
@@ -453,16 +426,6 @@ ISR(PCINT0_vect)
 
 static void txBegin()
 {
-  // Split one bit period into txDiv sub-ticks of txSubtick counts each, with
-  // txSubtick < 256 so OCR0A can be stepped on the free-running (prescaler-1)
-  // Timer0. Constant-folded: RNG_UART_BAUD and F_CPU are known at compile time.
-  uint16_t bitTicks = UART_BIT_CYCLES;
-  uint8_t div = (bitTicks + 254) / 255;    // fewest sub-ticks that fit 8 bits
-  if (div == 0)
-    div = 1;
-  txDiv = div;
-  txSubtick = (bitTicks + div / 2) / div;  // rounded, so the baud stays accurate
-
   PORTB |= _BV(UART_TX) | _BV(UART_RX);  // TX idle high; RX pull-up
   DDRB |= _BV(UART_TX);                   // TX output, RX stays input
   PCMSK = _BV(UART_RX);                   // pin-change only on RX (the start bit)
